@@ -1,144 +1,115 @@
-# AI SQL Query Generator
+# AI SQL Query RAG (SQL Server + Bilingual Chat)
 
-A demonstration application showcasing Query RAG (Retrieval-Augmented Generation) capabilities with AI-powered SQL query generation. This application allows users to upload CSV files, automatically analyze their contents, and use natural language to query the data through an AI workflow.
+Chat-first assistant for querying SQL Server with natural language (English/French).
 
-You can watch the full video here:
+## Current capabilities
 
-[![Learn about Query RAG](https://img.youtube.com/vi/5LIfSpr3GDM/0.jpg)](https://youtu.be/5LIfSpr3GDM)
-> 🎥 How to build advanced RAG systems with AI-generated SQL
-
-## Features
-
-- 📤 CSV file upload with drag-and-drop support
-- 📊 Automatic schema detection and PostgreSQL table creation
-- 🤖 AI-powered natural language to SQL conversion
-- 🔍 Smart query analysis and validation
-- 💡 Intelligent error handling and query regeneration
-- 🎯 Context-aware responses based on available data
+- Chat-only UI (CSV upload removed)
+- Bilingual interactions (EN/FR)
+- Backend `/chat` endpoint
+- LLM outputs a structured query plan (not raw SQL)
+- Backend validates plan and executes parameterized T-SQL
+- Client-friendly answer formatting (technical fields hidden unless asked)
 
 ## Architecture
 
-![AI SQL Query Generator Architecture](./architecture.png)
+- `ui`: React + Vite chat interface
+- `server`: Express + TypeScript + SQL Server (`mssql`)
+- LLM provider:
+  - default: Ollama (local/free)
+  - optional: OpenRouter
 
-The application consists of two main components:
+## API
 
-### Frontend (`ui/src/App.tsx`)
-- React-based UI utilizing TypeScript and shadcn/ui components
-- Enables users to upload CSV files and query the data using natural language
+### `POST /chat`
 
-### Backend (`server/src`)
-- Express.js server with TypeScript
-- PostgreSQL database integration
-- Multi-step AI query processing pipeline:
-  1. Query triage and classification
-  2. Schema analysis and table profiling
-  3. SQL generation
-  4. Result formatting
-  5. Answer validation
+Request:
 
-### Table Analyzer (`server/src/tableAnalyzer.ts`)
-The table analyzer component performs intelligent data profiling:
-- Samples data from uploaded tables
-- Analyzes column types, distinct values, and null ratios
-- Generates statistical summaries (min/max for numeric/dates)
-- Creates AI-powered descriptions of each field
-- Provides context for more accurate query generation
-
-## Setup
-
-1. Install dependencies:
-
-# Frontend
-```
-cd ui
-npm install
+```json
+{
+  "message": "do you have projects in casablanca?",
+  "language": "en"
+}
 ```
 
-# Backend
-1. Install dependencies:
-```
-cd server
-npm install
+`language` is optional (`en` or `fr`).
+
+Response:
+
+```json
+{
+  "language": "en",
+  "answer": "Friendly natural-language response",
+  "queryPlan": {},
+  "results": []
+}
 ```
 
-2. Set up your PostgreSQL database and configure environment variables:
-   Copy the `.env.sample` file to `.env` and update the values:
+## Environment setup
+
+Create `server/.env`:
 
 ```env
-DB_USER=postgres
-DB_HOST=localhost
-DB_NAME=sqlgen
-DB_PASSWORD=admin
-DB_PORT=5432
+DB_USER=your_sql_user
+DB_PASSWORD=your_sql_password
+DB_HOST=your_sql_host
+DB_PORT=1433
+DB_NAME=your_database
+DB_ENCRYPT=true
+DB_TRUST_SERVER_CERT=false
 PORT=3000
-OPENAI_API_KEY=your_openai_api_key
+
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=mistral
 ```
 
-3. Start the development servers:
+If using OpenRouter instead of Ollama:
 
-# Frontend
-```
-cd ui
-npm run dev
+```env
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=sk-or-v1-...
+OPENROUTER_MODEL=openai/gpt-4.1-mini
+OPENROUTER_HTTP_REFERER=http://localhost:5173
+OPENROUTER_X_TITLE=ai-sql-query-rag
 ```
 
-# Backend
-```
+## Run locally
+
+1. Start backend
+
+```bash
 cd server
+npm install
 npm run dev
 ```
 
-## How It Works
+2. Start frontend
 
-1. **CSV Upload**
-   - Upload a CSV file through drag-and-drop or file selection
-   - The server automatically detects column types and creates a PostgreSQL table
-   - Table schema is analyzed and stored for future queries
+```bash
+cd ui
+npm install
+npm run dev
+```
 
-2. **Query Processing**
-   - User enters a natural language question
-   - Query is classified as general, data-specific, or out-of-scope
-   - For data queries:
-     - Available schema is analyzed for relevance
-     - SQL query is generated using AI
-     - Results are formatted into natural language
-     - Response is validated for accuracy
+3. Open the UI (usually `http://localhost:5173`)
 
-3. **Error Handling**
-   - Multiple retry attempts for failed queries
-   - Context-aware error messages
-   - Query regeneration with previous error context
+## Ollama quick start
 
-## Example Usage
+```bash
+ollama pull mistral
+ollama serve
+```
 
-1. Upload a CSV file:
-   ```
-   Drag and drop your CSV file into the upload area
-   Enter a table name for your data
-   Click "Upload CSV"
-   ```
+If `ollama serve` says port already in use, Ollama is already running.
 
-2. Query your data:
-   ```
-   "Show me the total sales by region for last month"
-   "What was the average order value per customer?"
-   "Which products had the highest growth rate?"
-   ```
+## Smoke tests
 
-## Technical Details
+- EN: `do you have projects in casablanca?`
+- FR: `est ce que vous avez des projets a casablanca ?`
+- FR typo: `projets a casa?`
+- EN: `count projects where city starts with casa`
 
-The application uses a sophisticated prompt engineering approach to generate accurate SQL queries:
+## Requirements
 
-- Query classification to determine appropriate response type
-- Schema analysis to identify relevant tables and relationships
-- PostgreSQL-specific query generation with best practices
-- Multi-step validation to ensure accurate responses
-- Error recovery with context-aware query regeneration
-
-## Contributing
-
-This is a proof of concept and is not intended for production use. This repository is for educational purposes and will not be maintained. Please feel free to fork and maintain your own version!
-
-## License
-
-MIT License - feel free to use this code for your own projects!
+See `REQUIREMENTS.md` for machine prerequisites and setup checklist.
