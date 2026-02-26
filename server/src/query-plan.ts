@@ -1,6 +1,17 @@
 export type ChatLanguage = "en" | "fr";
 
 export type IntentType = "lookup" | "count" | "aggregate";
+export type PlannerStatus = "ok" | "need_clarification" | "out_of_scope";
+export type PlannerOperator = "=" | "!=" | "LIKE" | "IN";
+
+export type PlannerConcept =
+  | "LOCATION_CITY"
+  | "LOCATION_TEXT"
+  | "PROJECT_NAME"
+  | "PROJECT_DESCRIPTION"
+  | "PROJECT_STATUS"
+  | "PRICE"
+  | "SURFACE";
 
 export type FilterOperator =
   | "eq"
@@ -39,6 +50,7 @@ export interface AllowlistTable {
   schema: string;
   table: string;
   columns: Set<string>;
+  conceptMap: Record<PlannerConcept, string[]>;
 }
 
 export interface SchemaAllowlist {
@@ -46,8 +58,188 @@ export interface SchemaAllowlist {
   operators: Set<FilterOperator>;
 }
 
+export interface PlannerQueryPlan {
+  language: ChatLanguage;
+  status: PlannerStatus;
+  intent: IntentType;
+  table: string;
+  select: PlannerConcept[];
+  filters: Array<{
+    concept: PlannerConcept;
+    operator: PlannerOperator;
+    value: string | string[];
+  }>;
+  sort: Array<{
+    concept: PlannerConcept;
+    direction: "asc" | "desc";
+  }>;
+  limit: number;
+  aggregation:
+    | null
+    | {
+        func: "sum" | "avg" | "min" | "max";
+        concept: Exclude<PlannerConcept, "LOCATION_CITY" | "LOCATION_TEXT">;
+        group_by: PlannerConcept[];
+      };
+  ask_user: string | null;
+  notes: string;
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const ALLOWED_CONCEPTS: PlannerConcept[] = [
+  "LOCATION_CITY",
+  "LOCATION_TEXT",
+  "PROJECT_NAME",
+  "PROJECT_DESCRIPTION",
+  "PROJECT_STATUS",
+  "PRICE",
+  "SURFACE",
+];
+
+function isPlannerConcept(value: unknown): value is PlannerConcept {
+  return ALLOWED_CONCEPTS.includes(String(value) as PlannerConcept);
+}
+
+export function validatePlannerQueryPlan(
+  raw: unknown,
+): { ok: true; plan: PlannerQueryPlan } | { ok: false; errors: string[] } {
+  const errors: string[] = [];
+
+  if (!isPlainObject(raw)) {
+    return { ok: false, errors: ["Planner payload must be a JSON object."] };
+  }
+
+  const language = raw.language;
+  const status = raw.status;
+  const intent = raw.intent;
+  const table = raw.table;
+  const selectRaw = raw.select;
+  const filtersRaw = raw.filters;
+  const sortRaw = raw.sort;
+  const limitRaw = raw.limit;
+  const aggregationRaw = raw.aggregation;
+  const askUser = raw.ask_user;
+  const notes = raw.notes;
+
+  if (!(language === "en" || language === "fr")) errors.push("language must be en or fr.");
+  if (!["ok", "need_clarification", "out_of_scope"].includes(String(status))) {
+    errors.push("status is invalid.");
+  }
+  if (!["lookup", "count", "aggregate"].includes(String(intent))) errors.push("intent is invalid.");
+  if (typeof table !== "string" || table.trim().length === 0) errors.push("table must be a non-empty string.");
+  if (!Array.isArray(selectRaw)) errors.push("select must be an array.");
+  if (!Array.isArray(filtersRaw)) errors.push("filters must be an array.");
+  if (!Array.isArray(sortRaw)) errors.push("sort must be an array.");
+
+  let limit = 20;
+  if (typeof limitRaw === "number" && Number.isFinite(limitRaw)) {
+    limit = Math.trunc(limitRaw);
+  } else if (typeof limitRaw === "string" && !Number.isNaN(Number(limitRaw))) {
+    limit = Math.trunc(Number(limitRaw));
+  }
+  if (limit < 1 || limit > 50) errors.push("limit must be between 1 and 50.");
+
+  if (askUser !== null && askUser !== undefined && typeof askUser !== "string") {
+    errors.push("ask_user must be string or null.");
+  }
+  if (typeof notes !== "string") errors.push("notes must be a string.");
+
+  const select = (Array.isArray(selectRaw) ? selectRaw : []).filter(isPlannerConcept);
+  if (select.length !== (Array.isArray(selectRaw) ? selectRaw.length : 0)) {
+    errors.push("select includes unknown concepts.");
+  }
+
+  const filters: PlannerQueryPlan["filters"] = [];
+  for (const [i, item] of (Array.isArray(filtersRaw) ? filtersRaw : []).entries()) {
+    if (!isPlainObject(item)) {
+      errors.push(`filters[${i}] must be an object.`);
+      continue;
+    }
+    if (!isPlannerConcept(item.concept)) errors.push(`filters[${i}].concept is invalid.`);
+    if (!["=", "!=", "LIKE", "IN"].includes(String(item.operator))) {
+      errors.push(`filters[${i}].operator is invalid.`);
+    }
+    const value = item.value;
+    const validValue =
+      typeof value === "string" ||
+      (Array.isArray(value) && value.length > 0 && value.every((v) => typeof v === "string"));
+    if (!validValue) errors.push(`filters[${i}].value must be string or string array.`);
+    filters.push({
+      concept: item.concept as PlannerConcept,
+      operator: item.operator as PlannerOperator,
+      value: value as string | string[],
+    });
+  }
+
+  const sort: PlannerQueryPlan["sort"] = [];
+  for (const [i, item] of (Array.isArray(sortRaw) ? sortRaw : []).entries()) {
+    if (!isPlainObject(item)) {
+      errors.push(`sort[${i}] must be an object.`);
+      continue;
+    }
+    if (!isPlannerConcept(item.concept)) errors.push(`sort[${i}].concept is invalid.`);
+    if (!["asc", "desc"].includes(String(item.direction))) errors.push(`sort[${i}].direction is invalid.`);
+    sort.push({
+      concept: item.concept as PlannerConcept,
+      direction: item.direction as "asc" | "desc",
+    });
+  }
+
+  let aggregation: PlannerQueryPlan["aggregation"] = null;
+  if (aggregationRaw !== null && aggregationRaw !== undefined) {
+    if (!isPlainObject(aggregationRaw)) {
+      errors.push("aggregation must be an object or null.");
+    } else {
+      if (!["sum", "avg", "min", "max"].includes(String(aggregationRaw.func))) {
+        errors.push("aggregation.func is invalid.");
+      }
+      if (!isPlannerConcept(aggregationRaw.concept)) {
+        errors.push("aggregation.concept is invalid.");
+      }
+      const groupByRaw = aggregationRaw.group_by;
+      if (!Array.isArray(groupByRaw) || groupByRaw.some((c) => !isPlannerConcept(c))) {
+        errors.push("aggregation.group_by must be an array of concepts.");
+      }
+      aggregation = {
+        func: aggregationRaw.func as "sum" | "avg" | "min" | "max",
+        concept: aggregationRaw.concept as Exclude<PlannerConcept, "LOCATION_CITY" | "LOCATION_TEXT">,
+        group_by: (Array.isArray(groupByRaw) ? groupByRaw : []) as PlannerConcept[],
+      };
+    }
+  }
+
+  if (intent === "count" && aggregation !== null) {
+    errors.push("aggregation must be null for count intent.");
+  }
+  if (intent === "aggregate" && aggregation === null) {
+    errors.push("aggregation is required for aggregate intent.");
+  }
+
+  if (errors.length > 0) {
+    return { ok: false, errors };
+  }
+
+  const dedupedSelect = Array.from(new Set(select));
+
+  return {
+    ok: true,
+    plan: {
+      language: language as ChatLanguage,
+      status: status as PlannerStatus,
+      intent: intent as IntentType,
+      table: String(table),
+      select: dedupedSelect,
+      filters,
+      sort,
+      limit,
+      aggregation,
+      ask_user: askUser === undefined ? null : (askUser as string | null),
+      notes: String(notes),
+    },
+  };
 }
 
 export function validateQueryPlan(raw: unknown): { ok: true; plan: QueryPlan } | { ok: false; errors: string[] } {
@@ -282,10 +474,18 @@ export function compileQueryPlan(
     const fieldExpr = quoteIdent(filter.field);
     switch (filter.operator) {
       case "eq":
-        whereParts.push(`${fieldExpr} = ${paramRef(filter.value as string | number | boolean)}`);
+        if (typeof filter.value === "string") {
+          whereParts.push(`LOWER(CAST(${fieldExpr} AS NVARCHAR(4000))) = LOWER(CAST(${paramRef(filter.value)} AS NVARCHAR(4000)))`);
+        } else {
+          whereParts.push(`${fieldExpr} = ${paramRef(filter.value as string | number | boolean)}`);
+        }
         break;
       case "neq":
-        whereParts.push(`${fieldExpr} <> ${paramRef(filter.value as string | number | boolean)}`);
+        if (typeof filter.value === "string") {
+          whereParts.push(`LOWER(CAST(${fieldExpr} AS NVARCHAR(4000))) <> LOWER(CAST(${paramRef(filter.value)} AS NVARCHAR(4000)))`);
+        } else {
+          whereParts.push(`${fieldExpr} <> ${paramRef(filter.value as string | number | boolean)}`);
+        }
         break;
       case "gt":
         whereParts.push(`${fieldExpr} > ${paramRef(normalizeNumber(filter.value))}`);
@@ -300,10 +500,14 @@ export function compileQueryPlan(
         whereParts.push(`${fieldExpr} <= ${paramRef(normalizeNumber(filter.value))}`);
         break;
       case "contains":
-        whereParts.push(`${fieldExpr} LIKE ${paramRef(`%${String(filter.value)}%`)}`);
+        whereParts.push(
+          `LOWER(CAST(${fieldExpr} AS NVARCHAR(4000))) LIKE LOWER(CAST(${paramRef(`%${String(filter.value)}%`)} AS NVARCHAR(4000)))`,
+        );
         break;
       case "starts_with":
-        whereParts.push(`${fieldExpr} LIKE ${paramRef(`${String(filter.value)}%`)}`);
+        whereParts.push(
+          `LOWER(CAST(${fieldExpr} AS NVARCHAR(4000))) LIKE LOWER(CAST(${paramRef(`${String(filter.value)}%`)} AS NVARCHAR(4000)))`,
+        );
         break;
       case "in": {
         if (!Array.isArray(filter.value) || filter.value.length === 0) {

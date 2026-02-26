@@ -1,185 +1,426 @@
-import { useMemo, useState } from "react";
-import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
-import { Button } from "@/components/ui/button"
-import { Label } from "@/components/ui/label"
-import { Skeleton } from "@/components/ui/skeleton"
+import { FormEvent, useEffect, useMemo, useState } from "react";
+import { History, Home, Languages, MessageCircle, Plus, SendHorizonal } from "lucide-react";
+import { Button } from "@/components/ui/button";
 
 type Language = "en" | "fr";
+type Role = "user" | "assistant";
 
-type ChatResponse = {
+interface ChatMessage {
+  id: string;
+  role: Role;
+  content: string;
+  suggestions?: SuggestionChip[];
+}
+
+interface ChatSession {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messages: ChatMessage[];
+}
+
+interface ChatApiResponse {
   language: Language;
   answer: string;
-  queryPlan: unknown;
-  results: Array<Record<string, unknown>>;
-};
+  follow_up_question?: string;
+  suggestions?: SuggestionChip[];
+}
 
-const copy = {
+interface SuggestionChip {
+  label: string;
+  payload: string;
+  type?: string;
+}
+
+const STORAGE_KEY = "homebot-chat-sessions-v1";
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3000";
+
+const content = {
   en: {
-    title: "SQL Server Chat",
-    subtitle: "Ask questions about your database in natural language.",
-    inputLabel: "Message",
-    placeholder: "e.g. Show the top 10 customers in Paris",
-    ask: "Ask",
-    asking: "Asking...",
-    answer: "Answer",
-    results: "Results",
-    noRows: "No rows returned.",
-    language: "Language",
-    en: "English",
-    fr: "French",
-    error: "Chat request failed.",
+    appName: "HomeBot",
+    subtitle: "Your real estate assistant",
+    heroTitle: "How can I help you today?",
+    heroSubtitle: "Ask me anything about houses, projects, and listings.",
+    placeholder: "Ask about houses, projects...",
+    historyTitle: "History",
+    newChat: "New chat",
+    noHistory: "No saved chats yet.",
+    suggestions: [
+      "Show me available projects in Casablanca",
+      "What projects are currently in progress?",
+      "Tell me about 3-bedroom apartments",
+      "What are the latest listings?",
+    ],
+    failed: "I couldn't process that request. Please try again.",
   },
   fr: {
-    title: "Chat SQL Server",
-    subtitle: "Posez des questions sur votre base de donnees en langage naturel.",
-    inputLabel: "Message",
-    placeholder: "ex. Affiche les 10 meilleurs clients a Paris",
-    ask: "Envoyer",
-    asking: "Traitement...",
-    answer: "Reponse",
-    results: "Resultats",
-    noRows: "Aucune ligne retournee.",
-    language: "Langue",
-    en: "Anglais",
-    fr: "Francais",
-    error: "Echec de la requete chat.",
+    appName: "HomeBot",
+    subtitle: "Votre assistant immobilier",
+    heroTitle: "Comment puis-je vous aider aujourd'hui ?",
+    heroSubtitle: "Posez vos questions sur les maisons, projets et annonces.",
+    placeholder: "Posez une question sur les biens, projets...",
+    historyTitle: "Historique",
+    newChat: "Nouveau chat",
+    noHistory: "Aucun chat enregistre.",
+    suggestions: [
+      "Montre-moi les projets disponibles a Casablanca",
+      "Quels projets sont en cours actuellement ?",
+      "Parle-moi des appartements 3 chambres",
+      "Quelles sont les dernieres annonces ?",
+    ],
+    failed: "Je n'ai pas pu traiter votre demande. Veuillez reessayer.",
   },
 } as const;
 
+function makeSession(): ChatSession {
+  const now = new Date().toISOString();
+  const id = `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return {
+    id,
+    title: "New chat",
+    createdAt: now,
+    updatedAt: now,
+    messages: [],
+  };
+}
+
+function getSessionTitle(messages: ChatMessage[]): string {
+  const firstUserMessage = messages.find((msg) => msg.role === "user");
+  if (!firstUserMessage) return "New chat";
+  const title = firstUserMessage.content.trim();
+  if (title.length <= 40) return title;
+  return `${title.slice(0, 40)}...`;
+}
+
+function sortSessionsByUpdatedAt(sessions: ChatSession[]): ChatSession[] {
+  return [...sessions].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+}
+
+function renderMessageContent(content: string) {
+  const lines = content.split("\n").map((line) => line.trim()).filter(Boolean);
+  const bulletLines = lines.filter((line) => /^[-•]\s+/.test(line) || /^\d+\.\s+/.test(line));
+
+  if (bulletLines.length >= 2) {
+    return (
+      <ul className="list-disc space-y-2 pl-6">
+        {bulletLines.map((line, index) => (
+          <li key={`${line}-${index}`}>{line.replace(/^[-•]\s+/, "").replace(/^\d+\.\s+/, "")}</li>
+        ))}
+      </ul>
+    );
+  }
+
+  return <p className="whitespace-pre-line">{content}</p>;
+}
+
 function App() {
   const [language, setLanguage] = useState<Language>("en");
-  const [query, setQuery] = useState("");
-  const [answer, setAnswer] = useState<string | null>(null);
-  const [rows, setRows] = useState<Array<Record<string, unknown>>>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [isQuerying, setIsQuerying] = useState(false);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string>("");
 
-  const text = useMemo(() => copy[language], [language]);
-  const visibleColumns = useMemo(() => {
-    if (rows.length === 0) return [];
-    const all = Object.keys(rows[0]);
-    const blocked = [/^id$/i, /_id$/i, /uuid/i, /guid/i, /lat/i, /lng/i, /lon/i, /coord/i, /^location$/i];
-    const filtered = all.filter((key) => !blocked.some((pattern) => pattern.test(key)));
-    return filtered.length > 0 ? filtered : all;
-  }, [rows]);
+  const locale = useMemo(() => content[language], [language]);
 
-  const handleQuery = async () => {
-    if (!query) return;
+  useEffect(() => {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      const initial = makeSession();
+      setSessions([initial]);
+      setActiveSessionId(initial.id);
+      return;
+    }
 
-    setError(null);
-    setIsQuerying(true);
     try {
-      const response = await fetch("http://localhost:3000/chat", {
+      const parsed = JSON.parse(raw) as ChatSession[];
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        const initial = makeSession();
+        setSessions([initial]);
+        setActiveSessionId(initial.id);
+        return;
+      }
+      const sorted = sortSessionsByUpdatedAt(parsed);
+      setSessions(sorted);
+      setActiveSessionId(sorted[0].id);
+    } catch {
+      const initial = makeSession();
+      setSessions([initial]);
+      setActiveSessionId(initial.id);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (sessions.length > 0) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
+    }
+  }, [sessions]);
+
+  const activeSession = useMemo(
+    () => sessions.find((session) => session.id === activeSessionId) ?? null,
+    [sessions, activeSessionId],
+  );
+
+  const updateActiveSession = (updater: (session: ChatSession) => ChatSession) => {
+    setSessions((prev) =>
+      sortSessionsByUpdatedAt(
+        prev.map((session) => {
+          if (session.id !== activeSessionId) return session;
+          return updater(session);
+        }),
+      ),
+    );
+  };
+
+  const createNewSession = () => {
+    const session = makeSession();
+    setSessions((prev) => [session, ...prev]);
+    setActiveSessionId(session.id);
+    setInput("");
+  };
+
+  const sendMessage = async (rawMessage: string) => {
+    const message = rawMessage.trim();
+    if (!message || sending || !activeSession) return;
+
+    const userMessage: ChatMessage = {
+      id: `${Date.now()}-user`,
+      role: "user",
+      content: message,
+    };
+
+    updateActiveSession((session) => {
+      const nextMessages = [...session.messages, userMessage];
+      return {
+        ...session,
+        title: getSessionTitle(nextMessages),
+        messages: nextMessages,
+        updatedAt: new Date().toISOString(),
+      };
+    });
+
+    setInput("");
+    setSending(true);
+
+    try {
+      const response = await fetch(`${API_URL}/chat`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ message: query, language }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, language }),
       });
 
-      if (!response.ok) throw new Error(text.error);
+      if (!response.ok) throw new Error("chat_request_failed");
 
-      const data = (await response.json()) as ChatResponse;
-      setAnswer(data.answer);
-      setRows(data.results || []);
-    } catch (err) {
-      console.error("Chat error:", err);
-      setError(text.error);
+      const data = (await response.json()) as ChatApiResponse;
+      const assistantMessages: ChatMessage[] = [
+        {
+          id: `${Date.now()}-assistant`,
+          role: "assistant",
+          content: data.answer,
+          suggestions: data.suggestions?.slice(0, 8),
+        },
+      ];
+
+      if (
+        data.follow_up_question &&
+        data.follow_up_question.trim().toLowerCase() !== data.answer.trim().toLowerCase()
+      ) {
+        assistantMessages.push({
+          id: `${Date.now()}-assistant-follow-up`,
+          role: "assistant",
+          content: data.follow_up_question,
+          suggestions: data.suggestions?.slice(0, 8),
+        });
+      }
+
+      updateActiveSession((session) => ({
+        ...session,
+        messages: [...session.messages, ...assistantMessages],
+        updatedAt: new Date().toISOString(),
+      }));
+    } catch {
+      updateActiveSession((session) => ({
+        ...session,
+        messages: [
+          ...session.messages,
+          {
+            id: `${Date.now()}-assistant-error`,
+            role: "assistant",
+            content: locale.failed,
+          },
+        ],
+        updatedAt: new Date().toISOString(),
+      }));
     } finally {
-      setIsQuerying(false);
+      setSending(false);
     }
   };
 
+  const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    await sendMessage(input);
+  };
+
+  const messages = activeSession?.messages ?? [];
+
   return (
-    <div className="min-h-screen bg-background p-4">
-      <div className="max-w-4xl mx-auto">
-        <Card>
-          <CardHeader>
-            <CardTitle>{text.title}</CardTitle>
-            <p className="text-sm text-muted-foreground">{text.subtitle}</p>
-          </CardHeader>
-          <CardContent>
-            <div className="mb-4 flex items-center gap-2">
-              <Label>{text.language}</Label>
-              <Button
-                variant={language === "en" ? "default" : "outline"}
-                onClick={() => setLanguage("en")}
-              >
-                {text.en}
-              </Button>
-              <Button
-                variant={language === "fr" ? "default" : "outline"}
-                onClick={() => setLanguage("fr")}
-              >
-                {text.fr}
-              </Button>
+    <div className="min-h-screen bg-[#f4f5f4] text-slate-800">
+      <header className="h-20 border-b border-slate-200 bg-white/85 backdrop-blur-sm">
+        <div className="mx-auto flex h-full w-full max-w-7xl items-center justify-between px-6">
+          <button type="button" className="flex items-center gap-4" onClick={createNewSession}>
+            <div className="grid h-12 w-12 place-items-center rounded-2xl bg-emerald-50 text-emerald-600">
+              <Home className="h-6 w-6" />
             </div>
-            <Label htmlFor="query">{text.inputLabel}</Label>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                id="query"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                className="flex-1 px-3 py-2 border rounded-md"
-                placeholder={text.placeholder}
-              />
-              <Button onClick={handleQuery} disabled={isQuerying}>
-                {isQuerying ? text.asking : text.ask}
-              </Button>
+            <div className="text-left">
+              <p className="text-2xl font-bold leading-none">{locale.appName}</p>
+              <p className="text-sm text-slate-500">{locale.subtitle}</p>
             </div>
+          </button>
 
-            {isQuerying && (
-              <div className="mt-4">
-                <Skeleton className="h-20 w-full" />
-              </div>
+          <div className="flex items-center gap-2 rounded-full border border-slate-200 bg-white p-1">
+            <Languages className="ml-2 h-4 w-4 text-slate-500" />
+            <Button
+              size="sm"
+              variant={language === "en" ? "default" : "ghost"}
+              className={language === "en" ? "rounded-full bg-emerald-600 hover:bg-emerald-700" : "rounded-full"}
+              onClick={() => setLanguage("en")}
+            >
+              EN
+            </Button>
+            <Button
+              size="sm"
+              variant={language === "fr" ? "default" : "ghost"}
+              className={language === "fr" ? "rounded-full bg-emerald-600 hover:bg-emerald-700" : "rounded-full"}
+              onClick={() => setLanguage("fr")}
+            >
+              FR
+            </Button>
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto grid w-full max-w-7xl grid-cols-1 gap-6 px-6 pb-32 pt-8 lg:grid-cols-[280px_1fr]">
+        <aside className="rounded-2xl border border-slate-200 bg-white p-4">
+          <div className="mb-4 flex items-center justify-between">
+            <div className="flex items-center gap-2 text-slate-600">
+              <History className="h-4 w-4" />
+              <span className="font-semibold">{locale.historyTitle}</span>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              className="rounded-full border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+              onClick={createNewSession}
+            >
+              <Plus className="mr-1 h-4 w-4" />
+              {locale.newChat}
+            </Button>
+          </div>
+
+          <div className="space-y-2">
+            {sessions.length === 0 ? (
+              <p className="text-sm text-slate-500">{locale.noHistory}</p>
+            ) : (
+              sortSessionsByUpdatedAt(sessions).map((session) => (
+                <button
+                  type="button"
+                  key={session.id}
+                  onClick={() => setActiveSessionId(session.id)}
+                  className={`w-full rounded-xl px-3 py-2 text-left text-sm transition ${
+                    session.id === activeSessionId
+                      ? "bg-emerald-100 text-emerald-800"
+                      : "bg-slate-50 text-slate-700 hover:bg-slate-100"
+                  }`}
+                >
+                  <div className="truncate font-medium">{session.title}</div>
+                  <div className="text-xs text-slate-500">{new Date(session.updatedAt).toLocaleString()}</div>
+                </button>
+              ))
             )}
+          </div>
+        </aside>
 
-            {error && !isQuerying && <p className="mt-4 text-sm text-red-600">{error}</p>}
+        <section className="min-h-[60vh]">
+          {messages.length === 0 ? (
+            <section className="mx-auto mt-10 flex w-full max-w-2xl flex-col items-center gap-6 text-center">
+              <div className="grid h-20 w-20 place-items-center rounded-3xl bg-emerald-100 text-emerald-600">
+                <Home className="h-10 w-10" />
+              </div>
+              <h1 className="text-5xl font-bold tracking-tight text-slate-800">{locale.heroTitle}</h1>
+              <p className="text-xl text-slate-500">{locale.heroSubtitle}</p>
 
-            {answer && !isQuerying && (
-              <div className="mt-4 space-y-3">
-                <div className="p-4 bg-muted rounded-md">
-                  <p className="text-xs text-muted-foreground mb-1">{text.answer}</p>
-                  <p>{answer}</p>
-                </div>
-                <div className="p-4 border rounded-md overflow-x-auto">
-                  <p className="text-xs text-muted-foreground mb-2">{text.results}</p>
-                  {rows.length === 0 ? (
-                    <p>{text.noRows}</p>
-                  ) : (
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr>
-                          {visibleColumns.map((key) => (
-                            <th className="text-left p-2 border-b" key={key}>
-                              {key}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {rows.map((row, index) => (
-                          <tr key={index}>
-                            {visibleColumns.map((key) => (
-                              <td className="p-2 border-b" key={key}>
-                                {String(row[key])}
-                              </td>
-                            ))}
-                          </tr>
+              <div className="mt-4 w-full space-y-3">
+                {locale.suggestions.map((suggestion) => (
+                  <button
+                    key={suggestion}
+                    type="button"
+                    onClick={() => sendMessage(suggestion)}
+                    className="flex w-full items-center gap-3 rounded-2xl border border-slate-200 bg-white px-5 py-4 text-left text-2xl text-slate-700 shadow-sm transition hover:border-emerald-200 hover:bg-emerald-50"
+                  >
+                    <MessageCircle className="h-6 w-6 text-slate-400" />
+                    <span>{suggestion}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          ) : (
+            <section className="mx-auto flex w-full max-w-3xl flex-col gap-5">
+              {messages.map((message) => (
+                <div key={message.id} className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}>
+                  <div className="max-w-[85%]">
+                    <div
+                      className={`rounded-2xl px-5 py-4 text-lg leading-relaxed shadow-sm ${
+                        message.role === "user" ? "bg-emerald-600 text-white" : "bg-white text-slate-800"
+                      }`}
+                    >
+                      {renderMessageContent(message.content)}
+                    </div>
+                    {message.role === "assistant" && message.suggestions && message.suggestions.length > 0 && (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {message.suggestions.slice(0, 8).map((chip, idx) => (
+                          <button
+                            key={`${message.id}-chip-${idx}`}
+                            type="button"
+                            disabled={sending}
+                            onClick={() => sendMessage(chip.payload)}
+                            className="rounded-full border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-medium text-emerald-800 transition hover:bg-emerald-100 disabled:opacity-60"
+                          >
+                            {chip.label}
+                          </button>
                         ))}
-                      </tbody>
-                    </table>
-                  )}
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
-            )}
-          </CardContent>
-          <CardFooter />
-        </Card>
-      </div>
+              ))}
+            </section>
+          )}
+        </section>
+      </main>
+
+      <form
+        onSubmit={onSubmit}
+        className="fixed bottom-0 left-0 right-0 border-t border-slate-200 bg-white/95 backdrop-blur-sm"
+      >
+        <div className="mx-auto flex w-full max-w-5xl items-center gap-3 px-6 py-4">
+          <input
+            type="text"
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            placeholder={locale.placeholder}
+            className="h-14 flex-1 rounded-2xl border border-slate-200 bg-white px-5 text-lg outline-none ring-0 transition focus:border-emerald-300"
+          />
+          <Button
+            type="submit"
+            disabled={sending || input.trim().length === 0}
+            className="h-14 rounded-2xl bg-emerald-600 px-6 text-lg hover:bg-emerald-700"
+          >
+            <SendHorizonal className="h-5 w-5" />
+          </Button>
+        </div>
+      </form>
     </div>
-  )
+  );
 }
 
-export default App
+export default App;
