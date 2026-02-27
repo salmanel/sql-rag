@@ -42,14 +42,35 @@ function scoreColumn(column: string, include: string[], exclude: string[] = []):
   return score;
 }
 
-function buildConceptMap(columns: Set<string>): Record<PlannerConcept, string[]> {
+function applyPreferredOrder(columns: string[], preferred: string[]): string[] {
+  const normalized = new Set(columns.map((c) => c.toLowerCase()));
+  const orderedPreferred = preferred.filter((c) => normalized.has(c.toLowerCase()));
+  const remaining = columns.filter((c) => !orderedPreferred.includes(c));
+  return [...orderedPreferred, ...remaining];
+}
+
+function fromPreferredColumns(
+  columns: Set<string>,
+  preferred: Partial<Record<PlannerConcept, string[]>>,
+): Record<PlannerConcept, string[]> {
+  const base = {} as Record<PlannerConcept, string[]>;
+  for (const concept of CONCEPTS) {
+    const candidate = preferred[concept] || [];
+    base[concept] = candidate.filter((col, idx, arr) => columns.has(col.toLowerCase()) && arr.indexOf(col) === idx);
+  }
+  return base;
+}
+
+function buildConceptMap(tableKey: string, columns: Set<string>): Record<PlannerConcept, string[]> {
   const allColumns = Array.from(columns);
   const conceptTokens: Record<PlannerConcept, { include: string[]; exclude?: string[] }> = {
     LOCATION_CITY: {
-      include: ["city", "ville", "commune", "province"],
+      include: ["city", "ville", "commune", "province", "address", "adresse"],
+      exclude: ["lat", "lng", "lon", "coord", "latitude", "longitude"],
     },
     LOCATION_TEXT: {
-      include: ["address", "adresse", "location", "quartier", "zone", "secteur", "localisation"],
+      include: ["address", "adresse", "quartier", "zone", "secteur", "localisation", "location"],
+      exclude: ["lat", "lng", "lon", "coord", "latitude", "longitude"],
     },
     PROJECT_NAME: {
       include: ["name", "projectname", "nom", "title", "libelle"],
@@ -88,6 +109,69 @@ function buildConceptMap(columns: Set<string>): Record<PlannerConcept, string[]>
     map.LOCATION_CITY = map.LOCATION_TEXT.slice(0, 2);
   }
 
+  // Schema-aware overrides based on your domain tables.
+  if (tableKey === "projects") {
+    const preferred = fromPreferredColumns(columns, {
+      LOCATION_CITY: ["address"],
+      LOCATION_TEXT: ["address"],
+      PROJECT_NAME: ["name"],
+      PROJECT_DESCRIPTION: ["description"],
+      PROJECT_STATUS: ["statusglobal", "type", "overallprogress"],
+      PRICE: [],
+      SURFACE: [],
+    });
+    for (const concept of CONCEPTS) {
+      map[concept] = applyPreferredOrder(map[concept], preferred[concept]);
+    }
+  }
+
+  if (tableKey === "units") {
+    const preferred = fromPreferredColumns(columns, {
+      PROJECT_NAME: ["unitnumber", "id"],
+      PROJECT_DESCRIPTION: ["view", "orientation"],
+      PROJECT_STATUS: ["status"],
+      PRICE: ["latestprice", "pricesaleablevalue", "pricesaleablevalue1"],
+      SURFACE: [
+        "totalsurface",
+        "apartmentsurface",
+        "balconysurface",
+        "terracesurface",
+        "gardensurface",
+        "saleablevalue",
+        "saleablevalue1",
+      ],
+    });
+    for (const concept of CONCEPTS) {
+      map[concept] = applyPreferredOrder(map[concept], preferred[concept]);
+    }
+  }
+
+  if (tableKey === "immeubles") {
+    const preferred = fromPreferredColumns(columns, {
+      LOCATION_CITY: ["location"],
+      LOCATION_TEXT: ["location"],
+      PROJECT_NAME: ["name"],
+      PROJECT_DESCRIPTION: ["description"],
+      PROJECT_STATUS: ["status", "type", "residencytype"],
+      PRICE: ["minprice", "maxprice"],
+      SURFACE: ["minsellablesurfacerange", "maxsellablesurfacerange"],
+    });
+    for (const concept of CONCEPTS) {
+      map[concept] = applyPreferredOrder(map[concept], preferred[concept]);
+    }
+  }
+
+  if (tableKey === "quartiers") {
+    const preferred = fromPreferredColumns(columns, {
+      PROJECT_NAME: ["name"],
+      PROJECT_DESCRIPTION: ["description"],
+      LOCATION_TEXT: ["name"],
+    });
+    for (const concept of CONCEPTS) {
+      map[concept] = applyPreferredOrder(map[concept], preferred[concept]);
+    }
+  }
+
   return map;
 }
 
@@ -115,7 +199,7 @@ export async function loadSchemaAllowlist(): Promise<SchemaAllowlist> {
   }
 
   for (const table of tables.values()) {
-    table.conceptMap = buildConceptMap(table.columns);
+    table.conceptMap = buildConceptMap(table.table.toLowerCase(), table.columns);
   }
 
   return {

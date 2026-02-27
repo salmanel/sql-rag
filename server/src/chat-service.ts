@@ -32,6 +32,11 @@ interface PlannerOutcome {
   askUser: string | null;
 }
 
+interface PresetExecution {
+  plan: QueryPlan;
+  rows: Record<string, unknown>[];
+}
+
 const TECHNICAL_COLUMN_PATTERNS = [
   /^id$/i,
   /_id$/i,
@@ -53,6 +58,17 @@ const KNOWN_CITY_TOKENS = new Set([
   "tangier",
   "agadir",
 ]);
+
+const DEBUG_SQL = process.env.DEBUG_SQL === "true";
+
+function logSql(tag: string, sql: string, params: unknown[], rows?: number): void {
+  if (!DEBUG_SQL) return;
+  console.log(`[SQL:${tag}] ${sql}`);
+  console.log(`[SQL:${tag}:params] ${JSON.stringify(params)}`);
+  if (typeof rows === "number") {
+    console.log(`[SQL:${tag}:rows] ${rows}`);
+  }
+}
 
 function includesAny(text: string, terms: string[]): boolean {
   const lower = text.toLowerCase();
@@ -265,6 +281,144 @@ function normalizeForParsing(text: string): string {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "");
+}
+
+function detectPresetKind(
+  message: string,
+): "projects_available_city" | "projects_in_progress" | "three_bedroom" | "latest_listings" | null {
+  const lower = normalizeForParsing(message);
+  const hasProjectWord = /(project|projects|projet|projets)/.test(lower);
+
+  const isAvailableCity =
+    hasProjectWord &&
+    (/(available|disponible|disponibles)/.test(lower) || /\b(in|a|au|dans)\b/.test(lower)) &&
+    Boolean(extractLikelyLocationTerm(message));
+  if (isAvailableCity) return "projects_available_city";
+
+  const isInProgress =
+    hasProjectWord && /(in progress|en cours|sur plan|ongoing|currently in progress)/.test(lower);
+  if (isInProgress) return "projects_in_progress";
+
+  const isThreeBedroom =
+    /\b3\b/.test(lower) &&
+    /(bedroom|bedrooms|chambre|chambres)/.test(lower) &&
+    /(apartment|apartments|appartement|appartements|units|unites|unite)/.test(lower);
+  if (isThreeBedroom) return "three_bedroom";
+
+  const isLatestListings =
+    /(latest listings|latest projects|newest projects|dernieres annonces|projets recents|latest listing)/.test(lower);
+  if (isLatestListings) return "latest_listings";
+
+  return null;
+}
+
+async function runPresetQuery(message: string): Promise<PresetExecution | null> {
+  const preset = detectPresetKind(message);
+  if (!preset) return null;
+
+  if (preset === "projects_available_city") {
+    const city = extractLikelyLocationTerm(message);
+    if (!city) return null;
+    const likeCity = `%${city}%`;
+
+    const baseSql = `SELECT TOP (50)
+      [Id], [Name], [Address], [Description], [Type], [StatusGlobal]
+      FROM [dbo].[Projects]
+      WHERE LOWER(CAST([Address] AS NVARCHAR(4000))) LIKE LOWER(CAST(@p0 AS NVARCHAR(4000)))`;
+
+    const withAvailability = `${baseSql}
+      AND (
+        LOWER(CAST([Type] AS NVARCHAR(4000))) LIKE '%livraison%'
+        OR LOWER(CAST([StatusGlobal] AS NVARCHAR(4000))) LIKE '%available%'
+        OR LOWER(CAST([StatusGlobal] AS NVARCHAR(4000))) LIKE '%disponible%'
+      )
+      ORDER BY [Name] ASC;`;
+
+    let result = await query(withAvailability, [likeCity]);
+    logSql("preset:projects_available_city:strict", withAvailability, [likeCity], result.rows.length);
+
+    if ((result.rows || []).length === 0) {
+      const relaxed = `${baseSql} ORDER BY [Name] ASC;`;
+      result = await query(relaxed, [likeCity]);
+      logSql("preset:projects_available_city:relaxed", relaxed, [likeCity], result.rows.length);
+    }
+
+    return {
+      plan: {
+        intent: { type: "lookup", table: "projects", columns: ["name", "address", "description", "type", "statusglobal"] },
+        filters: [{ field: "address", operator: "contains", value: city }],
+        limit: 50,
+      },
+      rows: result.rows as Record<string, unknown>[],
+    };
+  }
+
+  if (preset === "projects_in_progress") {
+    const sql = `SELECT TOP (50)
+      [Id], [Name], [Address], [Description], [Type], [StatusGlobal], [OverAllProgress]
+      FROM [dbo].[Projects]
+      WHERE
+        LOWER(CAST([Type] AS NVARCHAR(4000))) LIKE '%sur plan%'
+        OR LOWER(CAST([StatusGlobal] AS NVARCHAR(4000))) LIKE '%progress%'
+        OR LOWER(CAST([StatusGlobal] AS NVARCHAR(4000))) LIKE '%en cours%'
+      ORDER BY [OverAllProgress] DESC, [Name] ASC;`;
+    const result = await query(sql, []);
+    logSql("preset:projects_in_progress", sql, [], result.rows.length);
+    return {
+      plan: {
+        intent: { type: "lookup", table: "projects", columns: ["name", "address", "description", "type", "statusglobal", "overallprogress"] },
+        filters: [],
+        limit: 50,
+        sort: { field: "overallprogress", direction: "desc" },
+      },
+      rows: result.rows as Record<string, unknown>[],
+    };
+  }
+
+  if (preset === "three_bedroom") {
+    const sql = `SELECT TOP (50)
+      u.[Id] AS [UnitId],
+      u.[NumberOfBedrooms],
+      u.[NumberOfBathrooms],
+      u.[TotalSurface],
+      u.[LatestPrice],
+      p.[Name] AS [ProjectName],
+      p.[Address] AS [Address],
+      i.[Name] AS [ImmeubleName],
+      i.[MinPrice],
+      i.[MaxPrice]
+      FROM [dbo].[Units] u
+      LEFT JOIN [dbo].[Projects] p ON p.[Id] = u.[ProjectId]
+      LEFT JOIN [dbo].[Immeubles] i ON i.[ProjectId] = u.[ProjectId]
+      WHERE u.[NumberOfBedrooms] = @p0
+      ORDER BY u.[LatestPrice] ASC;`;
+    const result = await query(sql, [3]);
+    logSql("preset:three_bedroom", sql, [3], result.rows.length);
+    return {
+      plan: {
+        intent: { type: "lookup", table: "units", columns: ["numberofbedrooms", "numberofbathrooms", "totalsurface", "latestprice"] },
+        filters: [{ field: "numberofbedrooms", operator: "eq", value: 3 }],
+        limit: 50,
+      },
+      rows: result.rows as Record<string, unknown>[],
+    };
+  }
+
+  const latestSql = `SELECT TOP (50)
+    [Id], [Name], [Address], [Description], [Type], [StatusGlobal]
+    FROM [dbo].[Projects]
+    ORDER BY [Id] DESC;`;
+  const latestResult = await query(latestSql, []);
+  logSql("preset:latest_listings", latestSql, [], latestResult.rows.length);
+  return {
+    plan: {
+      intent: { type: "lookup", table: "projects", columns: ["name", "address", "description", "type", "statusglobal"] },
+      filters: [],
+      limit: 50,
+      sort: { field: "id", direction: "desc" },
+    },
+    rows: latestResult.rows as Record<string, unknown>[],
+  };
 }
 
 function removeNoisyNameFilters(plan: QueryPlan, availableColumns: Set<string>): QueryPlan {
@@ -691,6 +845,7 @@ FROM ${quoteTable(table.schema, table.table)}
 WHERE (${whereParts.join(" OR ")});`;
 
     const result = await query(sql, params);
+    logSql(`rescue:${tableKey}`, sql, params, result.rows.length);
     const rows = dedupeRows(result.rows as Record<string, unknown>[]);
     if (rows.length === 0) continue;
 
@@ -973,6 +1128,61 @@ function enrichRowsWithPriceRange(
       price_range: `between ${low} and ${high}`,
     };
   });
+}
+
+function looksLikeNoResultsAnswer(text: string): boolean {
+  const lower = normalizeForParsing(text);
+  return (
+    lower.includes("no project") ||
+    lower.includes("no projects") ||
+    lower.includes("couldnt find") ||
+    lower.includes("could not find") ||
+    lower.includes("aucun projet") ||
+    lower.includes("pas de projet") ||
+    lower.includes("je nai pas trouve")
+  );
+}
+
+function firstExistingValue(row: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    const actual = Object.keys(row).find((k) => k.toLowerCase() === key.toLowerCase());
+    if (!actual) continue;
+    const value = row[actual];
+    if (value === null || value === undefined) continue;
+    const text = String(value).trim();
+    if (!text) continue;
+    return text;
+  }
+  return null;
+}
+
+function buildDeterministicRowsAnswer(
+  language: ChatLanguage,
+  rows: Record<string, unknown>[],
+): string {
+  const picked = rows.slice(0, 5).map((row) => {
+    const name = firstExistingValue(row, ["name", "project_name", "title"]) || "Project";
+    const city = firstExistingValue(row, ["address", "city", "ville"]);
+    const desc = firstExistingValue(row, ["description"]);
+    const priceRange = firstExistingValue(row, ["price_range"]);
+
+    const parts: string[] = [name];
+    if (city) {
+      parts.push(language === "fr" ? `a ${city}` : `in ${city}`);
+    }
+    if (priceRange) {
+      parts.push(language === "fr" ? `prix ${priceRange}` : `price ${priceRange}`);
+    }
+    if (desc) {
+      parts.push(desc);
+    }
+    return `- ${parts.join(": ")}`;
+  });
+
+  if (language === "fr") {
+    return `Voici les projets trouves:\n${picked.join("\n")}`;
+  }
+  return `Here are the projects found:\n${picked.join("\n")}`;
 }
 
 function coerceLanguage(language: unknown): ChatLanguage | null {
@@ -1283,10 +1493,17 @@ ${JSON.stringify(presentationRows)}`,
   try {
     const parsed = JSON.parse(response) as { answer?: string };
     if (typeof parsed.answer === "string" && parsed.answer.trim().length > 0) {
+      if (rows.length > 0 && looksLikeNoResultsAnswer(parsed.answer)) {
+        return buildDeterministicRowsAnswer(language, presentationRows);
+      }
       return parsed.answer;
     }
   } catch {
     // Fall through.
+  }
+
+  if (rows.length > 0) {
+    return buildDeterministicRowsAnswer(language, presentationRows);
   }
 
   return language === "fr"
@@ -1297,6 +1514,30 @@ ${JSON.stringify(presentationRows)}`,
 export async function chat(message: string, requestedLanguage?: unknown): Promise<ChatResponse> {
   const resolvedLanguage = coerceLanguage(requestedLanguage) ?? (await detectLanguage(message));
   const allowlist = await loadSchemaAllowlist();
+  const presetExecution = await runPresetQuery(message);
+  if (presetExecution) {
+    const rows = dedupeRows(presetExecution.rows);
+    const answer = await generateAnswer(resolvedLanguage, message, presetExecution.plan, rows);
+    const suggestions =
+      rows.length > 8
+        ? await buildChatSuggestions({
+            allowlist,
+            message,
+            language: resolvedLanguage,
+            tableKey: presetExecution.plan.intent.table,
+          })
+        : undefined;
+
+    return {
+      language: resolvedLanguage,
+      status: "ok",
+      answer,
+      suggestions,
+      queryPlan: presetExecution.plan,
+      results: rows,
+    };
+  }
+
   const forcedPlan = buildForcedProjectsAddressPlan(message, allowlist);
   const planning = forcedPlan
     ? {
@@ -1350,6 +1591,7 @@ export async function chat(message: string, requestedLanguage?: unknown): Promis
   let executedPlan = adjustedPlan;
   let { sql, params } = compileQueryPlan(executedPlan, allowlistValidation.table);
   let dbResult = await query(sql, params);
+  logSql("main", sql, params, dbResult.rows.length);
   let rows = dedupeRows(dbResult.rows as Record<string, unknown>[]);
 
   if (rows.length === 0) {
@@ -1358,6 +1600,7 @@ export async function chat(message: string, requestedLanguage?: unknown): Promis
       executedPlan = relaxed;
       const retry = compileQueryPlan(executedPlan, allowlistValidation.table);
       dbResult = await query(retry.sql, retry.params);
+      logSql("relaxed", retry.sql, retry.params, dbResult.rows.length);
       rows = dedupeRows(dbResult.rows as Record<string, unknown>[]);
 
       // Secondary fallback: try alternate textual location columns if still empty.
@@ -1374,6 +1617,7 @@ export async function chat(message: string, requestedLanguage?: unknown): Promis
             };
             const altQuery = compileQueryPlan(altPlan, allowlistValidation.table);
             const altResult = await query(altQuery.sql, altQuery.params);
+            logSql(`alt-column:${altCol}`, altQuery.sql, altQuery.params, altResult.rows.length);
             const altRows = dedupeRows(altResult.rows as Record<string, unknown>[]);
             if (altRows.length > 0) {
               executedPlan = altPlan;
@@ -1393,6 +1637,12 @@ export async function chat(message: string, requestedLanguage?: unknown): Promis
       if (!candidateAllowlist.ok) continue;
       const candidateQuery = compileQueryPlan(candidatePlan, candidateAllowlist.table);
       const candidateResult = await query(candidateQuery.sql, candidateQuery.params);
+      logSql(
+        `city-fallback:${candidatePlan.intent.table}:${candidatePlan.filters[0]?.field || "none"}`,
+        candidateQuery.sql,
+        candidateQuery.params,
+        candidateResult.rows.length,
+      );
       const candidateRows = dedupeRows(candidateResult.rows as Record<string, unknown>[]);
       if (candidateRows.length > 0) {
         executedPlan = candidatePlan;
