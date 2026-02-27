@@ -1,51 +1,66 @@
-# AI SQL Query RAG (SQL Server + Bilingual Chat)
+# AI SQL Query RAG
 
-Chat-first assistant for querying SQL Server with natural language (English/French).
+Chat-first assistant to query SQL Server in natural language (English/French), with safe backend execution and a client-friendly UI.
 
-## Current capabilities
+## What This Project Does
 
-- Chat-only UI (CSV upload removed)
-- Bilingual interactions (EN/FR)
-- Backend `/chat` endpoint
-- LLM outputs a structured query plan (not raw SQL)
-- Backend validates plan and executes parameterized T-SQL
-- Client-friendly answer formatting (technical fields hidden unless asked)
+- Chat-only UX (no CSV upload flow)
+- Bilingual conversation (`en` / `fr`)
+- LLM planner returns structured query intent (no raw SQL generation)
+- Backend validates and executes parameterized SQL Server queries
+- Client-friendly responses (hides technical IDs/coordinates unless requested)
+- Clickable suggestions in chat
+- Light/Dark theme switch in UI
+- Session history sidebar with independent scrolling
 
-## Architecture
+## Stack
 
-- `ui`: React + Vite chat interface
+- `ui`: React + Vite + TypeScript
 - `server`: Express + TypeScript + SQL Server (`mssql`)
 - LLM provider:
-  - default: Ollama (local/free)
+  - default: Ollama (local)
   - optional: OpenRouter
 
-## API
+## API Endpoints
 
-### `POST /chat`
+### `POST /chat` (legacy-compatible)
+### `POST /api/v1/chat` (versioned)
 
-Request:
+Request body:
 
 ```json
 {
-  "message": "do you have projects in casablanca?",
+  "message": "Show me available projects in Casablanca",
   "language": "en"
 }
 ```
 
 `language` is optional (`en` or `fr`).
 
-Response:
+Typical response:
 
 ```json
 {
   "language": "en",
-  "answer": "Friendly natural-language response",
+  "status": "ok",
+  "answer": "Friendly response text",
+  "suggestions": [
+    { "label": "Rabat", "payload": "projects in rabat", "type": "city" }
+  ],
   "queryPlan": {},
   "results": []
 }
 ```
 
-## Environment setup
+### `GET /api/v1/health`
+
+Response:
+
+```json
+{ "ok": true }
+```
+
+## Environment Setup
 
 Create `server/.env`:
 
@@ -62,9 +77,12 @@ PORT=3000
 LLM_PROVIDER=ollama
 OLLAMA_BASE_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=mistral
+
+# Optional troubleshooting
+DEBUG_SQL=false
 ```
 
-If using OpenRouter instead of Ollama:
+If using OpenRouter:
 
 ```env
 LLM_PROVIDER=openrouter
@@ -74,9 +92,9 @@ OPENROUTER_HTTP_REFERER=http://localhost:5173
 OPENROUTER_X_TITLE=ai-sql-query-rag
 ```
 
-## Run locally
+## Run Locally
 
-1. Start backend
+### Backend
 
 ```bash
 cd server
@@ -84,7 +102,7 @@ npm install
 npm run dev
 ```
 
-2. Start frontend
+### Frontend
 
 ```bash
 cd ui
@@ -92,24 +110,44 @@ npm install
 npm run dev
 ```
 
-3. Open the UI (usually `http://localhost:5173`)
+Open UI at `http://localhost:5173`.
 
-## Ollama quick start
+## Try The API
+
+Health:
 
 ```bash
-ollama pull mistral
-ollama serve
+curl http://localhost:3000/api/v1/health
 ```
 
-If `ollama serve` says port already in use, Ollama is already running.
+Chat:
 
-## Smoke tests
+```bash
+curl -X POST "http://localhost:3000/api/v1/chat" \
+  -H "Content-Type: application/json" \
+  -d "{\"message\":\"Show me available projects in Casablanca\",\"language\":\"en\"}"
+```
 
-- EN: `do you have projects in casablanca?`
-- FR: `est ce que vous avez des projets a casablanca ?`
-- FR typo: `projets a casa?`
-- EN: `count projects where city starts with casa`
+Windows `cmd` (single line):
+
+```bat
+curl -X POST "http://localhost:3000/api/v1/chat" -H "Content-Type: application/json" -d "{\"message\":\"Show me available projects in Casablanca\",\"language\":\"en\"}"
+```
+
+## Prompt Examples
+
+- `Show me available projects in Casablanca`
+- `Show me projects currently in progress`
+- `Tell me about 3-bedroom apartments`
+- `Show me the latest listings`
+- `Montre-moi les projets disponibles a Casablanca`
+
+## Notes
+
+- Project includes deterministic handling for key starter prompts to improve reliability.
+- SQL debugging logs can be enabled with `DEBUG_SQL=true`.
+- Keep `.env` and sensitive assets out of git.
 
 ## Requirements
 
-See `REQUIREMENTS.md` for machine prerequisites and setup checklist.
+See `REQUIREMENTS.md` for prerequisites and setup checklist.
