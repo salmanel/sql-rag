@@ -1,4 +1,6 @@
-import { loadSchemaAllowlist, renderAllowlistForPrompt } from "./allowlist";
+import { randomUUID } from "crypto";
+import { renderAllowlistForPrompt } from "./allowlist";
+import { getCachedAllowlist } from "./allowlist-cache";
 import { queryAI } from "./query-ai";
 import { query } from "./db";
 import { buildChatSuggestions, SuggestionChip } from "./suggestions";
@@ -16,6 +18,7 @@ import {
 } from "./query-plan";
 
 interface ChatResponse {
+  conversation_id: string;
   language: ChatLanguage;
   status?: PlannerStatus;
   answer: string;
@@ -136,6 +139,132 @@ function applyIntentAndOperatorHints(plan: QueryPlan, message: string): QueryPla
   return next;
 }
 
+type BroadEntity = "projects" | "annonces" | "immeubles" | "units" | null;
+
+function detectBroadEntityRequest(message: string): BroadEntity {
+  const lower = message.trim().toLowerCase();
+  const normalized = normalizeForParsing(lower);
+
+  const projectPatterns = [
+    /^projects?$/,
+    /^projets?$/,
+    /^list( all)? (projects?|projets?)$/,
+    /^show( me)?( all)?( the)? (projects?|projets?)$/,
+    /^can you (list|show)( all)?( the)? (projects?|projets?)$/,
+    /^(les |les derniers? |derniers? )?(projects?|projets?)$/,
+    /^montre[- ]?moi les (projects?|projets?)$/,
+  ];
+  if (projectPatterns.some((p) => p.test(normalized))) return "projects";
+
+  const annoncesPatterns = [
+    /^annonces?$/,
+    /^(les |les dernieres? |dernieres? )?annonces?$/,
+    /^(list|show|montre)[- ]?(moi )?(les )?(dernieres? )?(annonces?|listings?)$/,
+    /^listings?$/,
+    /^(latest |recent )?(listings?|annonces?)$/,
+    /^(les |les derniers? |derniers? )?listings?$/,
+  ];
+  if (annoncesPatterns.some((p) => p.test(normalized))) return "annonces";
+
+  const immeublesPatterns = [
+    /^immeubles?$/,
+    /^buildings?$/,
+    /^(les |les derniers? |derniers? )?immeubles?$/,
+    /^(list|show|montre)[- ]?(moi )?(les )?(derniers? )?(immeubles?|buildings?)$/,
+    /^(latest |recent )?(buildings?|immeubles?)$/,
+  ];
+  if (immeublesPatterns.some((p) => p.test(normalized))) return "immeubles";
+
+  const unitsPatterns = [
+    /^unites?$/,
+    /^units?$/,
+    /^(les |les dernieres? |dernieres? )?(unites?|units?)$/,
+    /^(list|show|montre)[- ]?(moi )?(les )?(dernieres? )?(unites?|units?)$/,
+    /^(latest |recent )?(units?|unites?)$/,
+  ];
+  if (unitsPatterns.some((p) => p.test(normalized))) return "units";
+
+  return null;
+}
+
+async function runBroadEntityQuery(entity: BroadEntity): Promise<PresetExecution | null> {
+  if (!entity) return null;
+
+  if (entity === "projects") {
+    const sql = `SELECT TOP (50)
+      [Id], [Name], [Address], [Description], [Type], [StatusGlobal]
+      FROM [dbo].[Projects]
+      ORDER BY [Id] DESC;`;
+    const result = await query(sql, []);
+    logSql("broad:projects", sql, [], result.rows.length);
+    return {
+      plan: {
+        intent: { type: "lookup", table: "projects", columns: ["name", "address", "description", "type", "statusglobal"] },
+        filters: [],
+        limit: 50,
+        sort: { field: "id", direction: "desc" },
+      },
+      rows: result.rows as Record<string, unknown>[],
+    };
+  }
+
+  if (entity === "annonces") {
+    const sql = `SELECT TOP (50)
+      [Id], [Name], [Address], [Description], [Type], [StatusGlobal]
+      FROM [dbo].[Projects]
+      ORDER BY [Id] DESC;`;
+    const result = await query(sql, []);
+    logSql("broad:annonces", sql, [], result.rows.length);
+    return {
+      plan: {
+        intent: { type: "lookup", table: "projects", columns: ["name", "address", "description", "type", "statusglobal"] },
+        filters: [],
+        limit: 50,
+        sort: { field: "id", direction: "desc" },
+      },
+      rows: result.rows as Record<string, unknown>[],
+    };
+  }
+
+  if (entity === "immeubles") {
+    const sql = `SELECT TOP (50)
+      [Id], [Name], [MinPrice], [MaxPrice]
+      FROM [dbo].[Immeubles]
+      ORDER BY [Id] DESC;`;
+    const result = await query(sql, []);
+    logSql("broad:immeubles", sql, [], result.rows.length);
+    return {
+      plan: {
+        intent: { type: "lookup", table: "immeubles", columns: ["name", "minprice", "maxprice"] },
+        filters: [],
+        limit: 50,
+        sort: { field: "id", direction: "desc" },
+      },
+      rows: result.rows as Record<string, unknown>[],
+    };
+  }
+
+  if (entity === "units") {
+    const sql = `SELECT TOP (50)
+      [Id], [NumberOfBedrooms], [NumberOfBathrooms], [TotalSurface], [LatestPrice]
+      FROM [dbo].[Units]
+      ORDER BY [Id] DESC;`;
+    const result = await query(sql, []);
+    logSql("broad:units", sql, [], result.rows.length);
+    return {
+      plan: {
+        intent: { type: "lookup", table: "units", columns: ["numberofbedrooms", "numberofbathrooms", "totalsurface", "latestprice"] },
+        filters: [],
+        limit: 50,
+        sort: { field: "id", direction: "desc" },
+      },
+      rows: result.rows as Record<string, unknown>[],
+    };
+  }
+
+  return null;
+}
+
 function shouldAutoListProjects(message: string): boolean {
   const lower = message.trim().toLowerCase();
   const projectOnlyPatterns = [
@@ -221,7 +350,6 @@ function normalizeSemanticFilters(
   const cityColumn = findColumn(availableColumns, ["city", "ville"]);
   const addressColumn = findColumn(availableColumns, ["address", "adresse", "full_address", "street_address"]);
 
-  // Prefer specific city fields over generic location/address when user asks city-level questions.
   if (cityColumn && includesAny(message, cityTerms)) {
     normalized.filters = normalized.filters.map((filter) => {
       const field = filter.field.toLowerCase();
@@ -231,7 +359,6 @@ function normalizeSemanticFilters(
       return filter;
     });
   } else if (addressColumn && includesAny(message, addressTerms)) {
-    // Prefer address fields when user explicitly asks for address.
     normalized.filters = normalized.filters.map((filter) => {
       if (filter.field.toLowerCase() === "city") {
         return { ...filter, field: addressColumn };
@@ -240,7 +367,6 @@ function normalizeSemanticFilters(
     });
   }
 
-  // Remove duplicate semantic filters like city=casablanca and address=casablanca.
   const seen = new Set<string>();
   normalized.filters = normalized.filters.filter((filter) => {
     const key = `${String(filter.value).toLowerCase()}::${filter.operator}`;
@@ -424,47 +550,31 @@ async function runPresetQuery(message: string): Promise<PresetExecution | null> 
 function removeNoisyNameFilters(plan: QueryPlan, availableColumns: Set<string>): QueryPlan {
   const nameCandidates = ["name", "project_name", "title", "nom"];
   const nameColumns = new Set(
-    nameCandidates.filter((candidate) => availableColumns.has(candidate)).map((v) => v.toLowerCase()),
+    nameCandidates.filter((c) => availableColumns.has(c)).map((v) => v.toLowerCase()),
   );
   const genericValues = new Set(["project", "projects", "projet", "projets", "realestate", "residence", "residences"]);
-
   const cleaned = plan.filters.filter((filter) => {
     const isNameField = nameColumns.has(filter.field.toLowerCase());
     const isGenericValue = typeof filter.value === "string" && genericValues.has(filter.value.trim().toLowerCase());
     return !(isNameField && isGenericValue);
   });
-
-  return {
-    ...plan,
-    filters: cleaned,
-  };
+  return { ...plan, filters: cleaned };
 }
 
 function removeAmbiguousAvailabilityFilters(plan: QueryPlan, availableColumns: Set<string>): QueryPlan {
   const statusCandidates = ["status", "state", "etat", "availability", "disponibilite"];
   const statusColumns = new Set(
-    statusCandidates.filter((candidate) => availableColumns.has(candidate)).map((v) => v.toLowerCase()),
+    statusCandidates.filter((c) => availableColumns.has(c)).map((v) => v.toLowerCase()),
   );
-
   const ambiguousStatusValues = new Set([
-    "available",
-    "availability",
-    "disponible",
-    "disponibilite",
-    "available projects",
+    "available", "availability", "disponible", "disponibilite", "available projects",
   ]);
-
   const filtered = plan.filters.filter((filter) => {
     const isStatusField = statusColumns.has(filter.field.toLowerCase());
     if (!isStatusField || typeof filter.value !== "string") return true;
-    const value = filter.value.trim().toLowerCase();
-    return !ambiguousStatusValues.has(value);
+    return !ambiguousStatusValues.has(filter.value.trim().toLowerCase());
   });
-
-  return {
-    ...plan,
-    filters: filtered,
-  };
+  return { ...plan, filters: filtered };
 }
 
 function enforceLocationFilterFromMessage(plan: QueryPlan, availableColumns: Set<string>, message: string): QueryPlan {
@@ -487,69 +597,35 @@ function enforceLocationFilterFromMessage(plan: QueryPlan, availableColumns: Set
       filters: plan.filters.map((f) => {
         if (!hasLocationLikeColumn(f.field)) return f;
         if (typeof f.value !== "string") return f;
-        return {
-          ...f,
-          field: primaryColumn,
-          operator: useContains ? "contains" : "eq",
-          value: normalizeLocationTerm(f.value),
-        };
+        return { ...f, field: primaryColumn, operator: useContains ? "contains" : "eq", value: normalizeLocationTerm(f.value) };
       }),
     };
   }
 
   return {
     ...plan,
-    filters: [
-      ...plan.filters,
-      {
-        field: primaryColumn,
-        operator: useContains ? "contains" : "eq",
-        value: term,
-      },
-    ],
+    filters: [...plan.filters, { field: primaryColumn, operator: useContains ? "contains" : "eq", value: term }],
   };
 }
 
-function applyDirectProjectLocationOverride(
-  plan: QueryPlan,
-  availableColumns: Set<string>,
-  message: string,
-): QueryPlan {
+function applyDirectProjectLocationOverride(plan: QueryPlan, availableColumns: Set<string>, message: string): QueryPlan {
   const lower = message.toLowerCase().trim();
   const looksLikeProjectLocationQuery =
-    /(project|projects|projet|projets)/.test(lower) &&
-    /\b(in|a|au|à|dans)\b/.test(lower);
-
-  if (!looksLikeProjectLocationQuery) {
-    return plan;
-  }
+    /(project|projects|projet|projets)/.test(lower) && /\b(in|a|au|à|dans)\b/.test(lower);
+  if (!looksLikeProjectLocationQuery) return plan;
 
   const rawTerm = extractLikelyLocationTerm(message);
-  if (!rawTerm) {
-    return plan;
-  }
+  if (!rawTerm) return plan;
 
   const locationColumns = rankLocationColumns(Array.from(availableColumns).filter(hasLocationLikeColumn));
-  if (locationColumns.length === 0) {
-    return plan;
-  }
+  if (locationColumns.length === 0) return plan;
 
   const addressPriority = ["address", "adresse", "full_address", "street_address"];
   const addressColumn = addressPriority.find((col) => availableColumns.has(col));
   const primaryColumn = addressColumn || locationColumns[0];
   const term = normalizeLocationTerm(rawTerm);
 
-  // Deterministic override for broad queries: keep only location filter.
-  return {
-    ...plan,
-    filters: [
-      {
-        field: primaryColumn,
-        operator: "contains",
-        value: term,
-      },
-    ],
-  };
+  return { ...plan, filters: [{ field: primaryColumn, operator: "contains", value: term }] };
 }
 
 function hasLocationLikeColumn(column: string): boolean {
@@ -582,59 +658,24 @@ function extractLikelyLocationTerm(message: string): string | null {
 
   const words = cleaned.split(/\s+/).filter(Boolean);
   for (const word of words) {
-    if (KNOWN_CITY_TOKENS.has(word)) {
-      return normalizeLocationTerm(word);
-    }
+    if (KNOWN_CITY_TOKENS.has(word)) return normalizeLocationTerm(word);
   }
 
   const prepositions = new Set(["in", "a", "au", "dans", "near", "pres", "de"]);
   const stopwords = new Set([
-    "what",
-    "about",
-    "location",
-    "city",
-    "ville",
-    "where",
-    "in",
-    "at",
-    "de",
-    "des",
-    "du",
-    "la",
-    "le",
-    "les",
-    "au",
-    "aux",
-    "dans",
-    "projects",
-    "project",
-    "projets",
-    "projet",
-    "known",
-    "available",
-    "show",
-    "list",
-    "have",
-    "you",
-    "your",
-    "the",
-    "all",
-    "are",
-    "is",
+    "what", "about", "location", "city", "ville", "where", "in", "at",
+    "de", "des", "du", "la", "le", "les", "au", "aux", "dans",
+    "projects", "project", "projets", "projet", "known", "available",
+    "show", "list", "have", "you", "your", "the", "all", "are", "is",
   ]);
 
   for (let i = 0; i < words.length - 1; i++) {
     if (!prepositions.has(words[i])) continue;
     const candidate = words[i + 1];
-    if (candidate.length > 1 && !stopwords.has(candidate)) {
-      return normalizeLocationTerm(candidate);
-    }
+    if (candidate.length > 1 && !stopwords.has(candidate)) return normalizeLocationTerm(candidate);
   }
 
-  if (words.length === 1 && KNOWN_CITY_TOKENS.has(words[0])) {
-    return normalizeLocationTerm(words[0]);
-  }
-
+  if (words.length === 1 && KNOWN_CITY_TOKENS.has(words[0])) return normalizeLocationTerm(words[0]);
   return null;
 }
 
@@ -659,19 +700,17 @@ function buildForcedProjectsAddressPlan(message: string, allowlist: SchemaAllowl
   const projectCandidates = Array.from(allowlist.tables.entries()).filter(([key]) => /project|projet/i.test(key));
   const structuralCandidates = Array.from(allowlist.tables.entries()).filter(([, table]) => {
     const cols = table.columns;
-    const hasLocationLike = getRankedLocationColumns(cols).length > 0;
-    const hasNameLike = ["name", "project_name", "title", "nom"].some((c) => cols.has(c));
-    return hasLocationLike && hasNameLike;
+    return getRankedLocationColumns(cols).length > 0 && ["name", "project_name", "title", "nom"].some((c) => cols.has(c));
   });
 
   const scoreTable = (key: string, table: AllowlistTable): number => {
-    let score = 0;
-    if (key === "projects") score += 100;
-    if (key === "project") score += 90;
-    if (/project|projet/.test(key)) score += 60;
-    if (getRankedLocationColumns(table.columns).length > 0) score += 50;
-    if (["name", "project_name", "title", "nom"].some((col) => table.columns.has(col))) score += 30;
-    return score;
+    let s = 0;
+    if (key === "projects") s += 100;
+    if (key === "project") s += 90;
+    if (/project|projet/.test(key)) s += 60;
+    if (getRankedLocationColumns(table.columns).length > 0) s += 50;
+    if (["name", "project_name", "title", "nom"].some((col) => table.columns.has(col))) s += 30;
+    return s;
   };
 
   const allCandidates = [...projectCandidates, ...structuralCandidates].sort(
@@ -681,41 +720,21 @@ function buildForcedProjectsAddressPlan(message: string, allowlist: SchemaAllowl
   const projects = directProjects || (bestCandidateEntry ? bestCandidateEntry[1] : null);
   if (!projects) return null;
 
-  const tableKey =
-    directProjects
-      ? "projects"
-      : (bestCandidateEntry ? bestCandidateEntry[0] : "projects");
-
+  const tableKey = directProjects ? "projects" : (bestCandidateEntry ? bestCandidateEntry[0] : "projects");
   const primaryLocationColumn = getRankedLocationColumns(projects.columns)[0];
   if (!primaryLocationColumn && cityToken) return null;
 
   const preferredColumns = [
-    "name",
-    "project_name",
-    "title",
+    "name", "project_name", "title",
     ...(primaryLocationColumn ? [primaryLocationColumn] : []),
-    "description",
-    "status",
-    "minprice",
-    "maxprice",
+    "description", "status", "minprice", "maxprice",
   ].filter((col, idx, arr) => projects.columns.has(col) && arr.indexOf(col) === idx);
 
   return {
-    intent: {
-      type: "lookup",
-      table: tableKey,
-      columns: preferredColumns.length > 0 ? preferredColumns : undefined,
-    },
-    filters:
-      cityToken && primaryLocationColumn
-        ? [
-            {
-              field: primaryLocationColumn,
-              operator: "contains",
-              value: cityToken,
-            },
-          ]
-        : [],
+    intent: { type: "lookup", table: tableKey, columns: preferredColumns.length > 0 ? preferredColumns : undefined },
+    filters: cityToken && primaryLocationColumn
+      ? [{ field: primaryLocationColumn, operator: "contains", value: cityToken }]
+      : [],
     limit: 50,
     sort: undefined,
   };
@@ -727,9 +746,8 @@ function buildCityFallbackPlans(message: string, allowlist: SchemaAllowlist): Qu
 
   const candidates = Array.from(allowlist.tables.entries())
     .filter(([, table]) => {
-      const hasLocationLike = getRankedLocationColumns(table.columns).length > 0;
-      const hasNameLike = ["name", "project_name", "title", "nom"].some((c) => table.columns.has(c));
-      return hasLocationLike && hasNameLike;
+      return getRankedLocationColumns(table.columns).length > 0 &&
+        ["name", "project_name", "title", "nom"].some((c) => table.columns.has(c));
     })
     .sort(([aKey], [bKey]) => {
       const score = (key: string): number => {
@@ -746,149 +764,137 @@ function buildCityFallbackPlans(message: string, allowlist: SchemaAllowlist): Qu
     const locationColumns = getRankedLocationColumns(tableMeta.columns);
     for (const locationColumn of locationColumns) {
       const preferredColumns = [
-        "name",
-        "project_name",
-        "title",
-        locationColumn,
-        "description",
-        "status",
-        "minprice",
-        "maxprice",
+        "name", "project_name", "title", locationColumn,
+        "description", "status", "minprice", "maxprice",
+      ].filter((col, idx, arr) => tableMeta.columns.has(col) && arr.indexOf(col) === idx);
+
+      // Level 2: location column contains city token
+      plans.push({
+        intent: { type: "lookup" as const, table: tableKey, columns: preferredColumns.length > 0 ? preferredColumns : undefined },
+        filters: [{ field: locationColumn, operator: "contains" as const, value: cityToken }],
+        limit: 50,
+        sort: undefined,
+      });
+    }
+
+    // Level 3: also search in description column for city token
+    const descCol = ["description", "details", "summary"].find((c) => tableMeta.columns.has(c));
+    if (descCol) {
+      const preferredColumns = [
+        "name", "project_name", "title",
+        ...getRankedLocationColumns(tableMeta.columns).slice(0, 2),
+        descCol, "status", "minprice", "maxprice",
       ].filter((col, idx, arr) => tableMeta.columns.has(col) && arr.indexOf(col) === idx);
 
       plans.push({
-        intent: {
-          type: "lookup" as const,
-          table: tableKey,
-          columns: preferredColumns.length > 0 ? preferredColumns : undefined,
-        },
-        filters: [
-          {
-            field: locationColumn,
-            operator: "contains" as const,
-            value: cityToken,
-          },
-        ],
+        intent: { type: "lookup" as const, table: tableKey, columns: preferredColumns.length > 0 ? preferredColumns : undefined },
+        filters: [{ field: descCol, operator: "contains" as const, value: cityToken }],
+        limit: 50,
+        sort: undefined,
+      });
+    }
+
+    // Level 4: search in name column for city token
+    const nameCol = ["name", "project_name", "title", "nom"].find((c) => tableMeta.columns.has(c));
+    if (nameCol) {
+      const preferredColumns = [
+        "name", "project_name", "title",
+        ...getRankedLocationColumns(tableMeta.columns).slice(0, 2),
+        "description", "status", "minprice", "maxprice",
+      ].filter((col, idx, arr) => tableMeta.columns.has(col) && arr.indexOf(col) === idx);
+
+      plans.push({
+        intent: { type: "lookup" as const, table: tableKey, columns: preferredColumns.length > 0 ? preferredColumns : undefined },
+        filters: [{ field: nameCol, operator: "contains" as const, value: cityToken }],
         limit: 50,
         sort: undefined,
       });
     }
   }
-
   return plans;
 }
 
-function detectProjectCityRequest(message: string): { city: string | null; projectIntent: boolean } {
-  const city = extractCityTokenForForcedProjects(message);
+/**
+ * Extract additional filter terms from the message beyond city, e.g. district, property type, status keywords.
+ */
+function extractAdditionalFilterTerms(message: string): { district: string | null; propertyType: string | null; statusKeyword: string | null } {
   const lower = normalizeForParsing(message);
-  const projectIntent = /(project|projects|projet|projets)/.test(lower) || Boolean(city);
-  return { city, projectIntent };
-}
 
-function quoteIdent(identifier: string): string {
-  return `[${identifier.replace(/]/g, "]]")}]`;
-}
-
-function quoteTable(schema: string, table: string): string {
-  return `${quoteIdent(schema)}.${quoteIdent(table)}`;
-}
-
-async function runProjectCityRescueLookup(
-  message: string,
-  allowlist: SchemaAllowlist,
-): Promise<{ plan: QueryPlan; rows: Record<string, unknown>[] } | null> {
-  const intent = detectProjectCityRequest(message);
-  if (!intent.projectIntent || !intent.city) return null;
-
-  const candidates = Array.from(allowlist.tables.entries())
-    .filter(([, table]) => {
-      const hasNameLike = ["name", "project_name", "title", "nom"].some((c) => table.columns.has(c));
-      const hasLocationLike = getRankedLocationColumns(table.columns).length > 0;
-      return hasNameLike && hasLocationLike;
-    })
-    .sort(([aKey], [bKey]) => {
-      const score = (key: string): number => {
-        if (key === "projects") return 100;
-        if (/project|projet/i.test(key)) return 70;
-        return 10;
-      };
-      return score(bKey) - score(aKey);
-    });
-
-  for (const [tableKey, table] of candidates) {
-    const locationCols = getRankedLocationColumns(table.columns).slice(0, 4);
-    if (locationCols.length === 0) continue;
-
-    const selectedColumns = [
-      "name",
-      "project_name",
-      "title",
-      ...locationCols,
-      "description",
-      "status",
-      "minprice",
-      "maxprice",
-    ].filter((col, idx, arr) => table.columns.has(col) && arr.indexOf(col) === idx);
-
-    const whereParts: string[] = [];
-    const params: Array<string | number | boolean | Date | null> = [];
-    for (const col of locationCols) {
-      const ref = `@p${params.length}`;
-      params.push(`%${intent.city}%`);
-      whereParts.push(
-        `LOWER(CAST(${quoteIdent(col)} AS NVARCHAR(4000))) LIKE LOWER(CAST(${ref} AS NVARCHAR(4000)))`,
-      );
+  // District: words after "in", "a", "au", "dans", "quartier" that are NOT known city tokens
+  let district: string | null = null;
+  const districtPatterns = [
+    /(?:quartier|district|secteur|zone)\s+(?:de\s+|du\s+|d')?(\w+)/,
+    /(?:a|au|dans|in)\s+(\w+)\s+(?:a|au|dans|in)\s+(\w+)/,
+  ];
+  for (const pattern of districtPatterns) {
+    const match = lower.match(pattern);
+    if (match) {
+      // Take the last captured group (for "in X in Y", Y is city, X is district)
+      const candidates = match.slice(1).filter(Boolean);
+      for (const c of candidates) {
+        if (!KNOWN_CITY_TOKENS.has(c) && c.length > 2) {
+          district = c;
+          break;
+        }
+      }
     }
-
-    const sql = `SELECT TOP (50) ${selectedColumns.length > 0 ? selectedColumns.map(quoteIdent).join(", ") : "*"}
-FROM ${quoteTable(table.schema, table.table)}
-WHERE (${whereParts.join(" OR ")});`;
-
-    const result = await query(sql, params);
-    logSql(`rescue:${tableKey}`, sql, params, result.rows.length);
-    const rows = dedupeRows(result.rows as Record<string, unknown>[]);
-    if (rows.length === 0) continue;
-
-    return {
-      plan: {
-        intent: {
-          type: "lookup",
-          table: tableKey,
-          columns: selectedColumns.length > 0 ? selectedColumns : undefined,
-        },
-        filters: [
-          {
-            field: locationCols[0],
-            operator: "contains",
-            value: intent.city,
-          },
-        ],
-        limit: 50,
-        sort: undefined,
-      },
-      rows,
-    };
   }
 
-  return null;
+  // Property type
+  let propertyType: string | null = null;
+  const typePatterns: Array<[RegExp, string]> = [
+    [/\b(appartement|apartment|appart)\b/, "appartement"],
+    [/\b(villa|villas)\b/, "villa"],
+    [/\b(studio|studios)\b/, "studio"],
+    [/\b(duplex)\b/, "duplex"],
+    [/\b(penthouse)\b/, "penthouse"],
+    [/\b(bureau|office|bureaux)\b/, "bureau"],
+    [/\b(commerce|commercial|shop|magasin)\b/, "commerce"],
+    [/\b(terrain|land|lot)\b/, "terrain"],
+    [/\b(maison|house)\b/, "maison"],
+    [/\b(loft)\b/, "loft"],
+    [/\b(riad)\b/, "riad"],
+  ];
+  for (const [pattern, type] of typePatterns) {
+    if (pattern.test(lower)) {
+      propertyType = type;
+      break;
+    }
+  }
+
+  // Status keyword
+  let statusKeyword: string | null = null;
+  const statusPatterns: Array<[RegExp, string]> = [
+    [/\b(neuf|new|nouveau|nouvelle)\b/, "neuf"],
+    [/\b(ancien|old|resale)\b/, "ancien"],
+    [/\b(disponible|available)\b/, "disponible"],
+    [/\b(en cours|in progress|sur plan)\b/, "en cours"],
+    [/\b(livr[eé]|delivered|pret|ready)\b/, "livre"],
+  ];
+  for (const [pattern, status] of statusPatterns) {
+    if (pattern.test(lower)) {
+      statusKeyword = status;
+      break;
+    }
+  }
+
+  return { district, propertyType, statusKeyword };
 }
 
-function buildRelaxedLocationPlan(
-  plan: QueryPlan,
-  availableColumns: Set<string>,
-  message: string,
-): QueryPlan | null {
-  if (plan.intent.type !== "lookup") return null;
+interface ProgressiveFallbackResult {
+  plan: QueryPlan;
+  rows: Record<string, unknown>[];
+  matchLevel: "exact" | "close" | "city" | "semantic" | "alternative";
+}
 
+function buildRelaxedLocationPlan(plan: QueryPlan, availableColumns: Set<string>, message: string): QueryPlan | null {
+  if (plan.intent.type !== "lookup") return null;
   const locationColumns = rankLocationColumns(Array.from(availableColumns).filter(hasLocationLikeColumn));
   if (locationColumns.length === 0) return null;
 
-  const relaxed: QueryPlan = {
-    ...plan,
-    filters: [...plan.filters],
-  };
-
+  const relaxed: QueryPlan = { ...plan, filters: [...plan.filters] };
   let changed = false;
+
   relaxed.filters = relaxed.filters.map((filter) => {
     if (hasLocationLikeColumn(filter.field) && filter.operator !== "contains") {
       changed = true;
@@ -901,15 +907,136 @@ function buildRelaxedLocationPlan(
     const term = extractLikelyLocationTerm(message);
     if (term) {
       changed = true;
-      relaxed.filters.push({
-        field: locationColumns[0],
-        operator: "contains",
-        value: term,
-      });
+      relaxed.filters.push({ field: locationColumns[0], operator: "contains", value: term });
+    }
+  }
+  return changed ? relaxed : null;
+}
+
+/**
+ * Progressively relax filters to find the best available results.
+ * Returns the best match level found with its rows.
+ */
+async function progressiveFallbackSearch(
+  basePlan: QueryPlan,
+  tableMeta: AllowlistTable,
+  message: string,
+  allowlist: SchemaAllowlist,
+): Promise<ProgressiveFallbackResult | null> {
+  // Level 1: exact (already tried before calling this)
+  // Level 2: relax operators to contains
+  const relaxedPlan = buildRelaxedLocationPlan(basePlan, tableMeta.columns, message);
+  if (relaxedPlan) {
+    const retry = compileQueryPlan(relaxedPlan, tableMeta);
+    const result = await query(retry.sql, retry.params);
+    logSql("progressive:L2-relaxed", retry.sql, retry.params, result.rows.length);
+    const rows = dedupeRows(result.rows as Record<string, unknown>[]);
+    if (rows.length > 0) {
+      return { plan: relaxedPlan, rows, matchLevel: "close" };
+    }
+
+    // Level 2b: try alternate location columns
+    const firstLocationFilter = relaxedPlan.filters.find((f) => hasLocationLikeColumn(f.field));
+    if (firstLocationFilter) {
+      const alternatives = getAlternativeLocationColumns(tableMeta.columns, firstLocationFilter.field);
+      for (const altCol of alternatives) {
+        const altPlan: QueryPlan = {
+          ...relaxedPlan,
+          filters: relaxedPlan.filters.map((f) =>
+            f === firstLocationFilter ? { ...f, field: altCol, operator: "contains" } : f,
+          ),
+        };
+        const altQuery = compileQueryPlan(altPlan, tableMeta);
+        const altResult = await query(altQuery.sql, altQuery.params);
+        logSql(`progressive:L2b-alt:${altCol}`, altQuery.sql, altQuery.params, altResult.rows.length);
+        const altRows = dedupeRows(altResult.rows as Record<string, unknown>[]);
+        if (altRows.length > 0) {
+          return { plan: altPlan, rows: altRows, matchLevel: "close" };
+        }
+      }
     }
   }
 
-  return changed ? relaxed : null;
+  // Level 3: drop non-location filters, keep only city
+  const cityToken = extractLikelyLocationTerm(message);
+  if (cityToken) {
+    const locationCols = getRankedLocationColumns(tableMeta.columns);
+    for (const locCol of locationCols) {
+      const cityOnlyPlan: QueryPlan = {
+        ...basePlan,
+        filters: [{ field: locCol, operator: "contains", value: cityToken }],
+      };
+      const cityQuery = compileQueryPlan(cityOnlyPlan, tableMeta);
+      const cityResult = await query(cityQuery.sql, cityQuery.params);
+      logSql(`progressive:L3-city:${locCol}`, cityQuery.sql, cityQuery.params, cityResult.rows.length);
+      const cityRows = dedupeRows(cityResult.rows as Record<string, unknown>[]);
+      if (cityRows.length > 0) {
+        return { plan: cityOnlyPlan, rows: cityRows, matchLevel: "city" };
+      }
+    }
+
+    // Level 3b: search description for city token
+    const descCol = ["description", "details", "summary"].find((c) => tableMeta.columns.has(c));
+    if (descCol) {
+      const descPlan: QueryPlan = {
+        ...basePlan,
+        filters: [{ field: descCol, operator: "contains", value: cityToken }],
+      };
+      const descQuery = compileQueryPlan(descPlan, tableMeta);
+      const descResult = await query(descQuery.sql, descQuery.params);
+      logSql(`progressive:L3b-desc`, descQuery.sql, descQuery.params, descResult.rows.length);
+      const descRows = dedupeRows(descResult.rows as Record<string, unknown>[]);
+      if (descRows.length > 0) {
+        return { plan: descPlan, rows: descRows, matchLevel: "city" };
+      }
+    }
+  }
+
+  // Level 4: cross-table city fallback plans
+  const cityFallbackPlans = buildCityFallbackPlans(message, allowlist);
+  for (const candidatePlan of cityFallbackPlans) {
+    const candidateAllowlist = validateAgainstAllowlist(candidatePlan, allowlist);
+    if (!candidateAllowlist.ok) continue;
+    const candidateQuery = compileQueryPlan(candidatePlan, candidateAllowlist.table);
+    const candidateResult = await query(candidateQuery.sql, candidateQuery.params);
+    logSql(
+      `progressive:L4-cross:${candidatePlan.intent.table}:${candidatePlan.filters[0]?.field || "none"}`,
+      candidateQuery.sql, candidateQuery.params, candidateResult.rows.length,
+    );
+    const candidateRows = dedupeRows(candidateResult.rows as Record<string, unknown>[]);
+    if (candidateRows.length > 0) {
+      return { plan: candidatePlan, rows: candidateRows, matchLevel: "semantic" };
+    }
+  }
+
+  // Level 5: rescue lookup
+  const rescued = await runProjectCityRescueLookup(message, allowlist);
+  if (rescued && rescued.rows.length > 0) {
+    return { plan: rescued.plan, rows: rescued.rows, matchLevel: "alternative" };
+  }
+
+  // Level 5b: drop ALL filters and return latest from the same table
+  if (basePlan.intent.table) {
+    const noFilterPlan: QueryPlan = {
+      ...basePlan,
+      filters: [],
+      limit: Math.min(basePlan.limit || 20, 20),
+      sort: { field: "id", direction: "desc" },
+    };
+    try {
+      const noFilterQuery = compileQueryPlan(noFilterPlan, tableMeta);
+      const noFilterResult = await query(noFilterQuery.sql, noFilterQuery.params);
+      logSql("progressive:L5b-nofilter", noFilterQuery.sql, noFilterQuery.params, noFilterResult.rows.length);
+      const noFilterRows = dedupeRows(noFilterResult.rows as Record<string, unknown>[]);
+      if (noFilterRows.length > 0) {
+        return { plan: noFilterPlan, rows: noFilterRows, matchLevel: "alternative" };
+      }
+    } catch {
+      // Sort by id may fail if id is not in columns; ignore
+    }
+  }
+
+  return null;
 }
 
 function getAlternativeLocationColumns(availableColumns: Set<string>, current: string): string[] {
@@ -918,55 +1045,19 @@ function getAlternativeLocationColumns(availableColumns: Set<string>, current: s
   );
 }
 
-function applyClientFriendlyProjection(
-  plan: QueryPlan,
-  availableColumns: Set<string>,
-  message: string,
-): QueryPlan {
-  if (plan.intent.type !== "lookup") {
-    return plan;
-  }
+function applyClientFriendlyProjection(plan: QueryPlan, availableColumns: Set<string>, message: string): QueryPlan {
+  if (plan.intent.type !== "lookup") return plan;
 
   const explicitlyAsksTechnicalFields = includesAny(message, [
-    "id",
-    "uuid",
-    "guid",
-    "coord",
-    "coordinate",
-    "latitude",
-    "longitude",
-    "lat",
-    "lng",
-    "location",
+    "id", "uuid", "guid", "coord", "coordinate", "latitude", "longitude", "lat", "lng", "location",
   ]);
-
-  if (explicitlyAsksTechnicalFields) {
-    return plan;
-  }
+  if (explicitlyAsksTechnicalFields) return plan;
 
   const preferred = [
-    "name",
-    "project_name",
-    "title",
-    "address",
-    "full_address",
-    "street_address",
-    "description",
-    "details",
-    "summary",
+    "name", "project_name", "title", "address", "full_address", "street_address",
+    "description", "details", "summary",
   ];
-
-  const blockedPatterns = [
-    /^id$/,
-    /_id$/,
-    /uuid/,
-    /guid/,
-    /lat/,
-    /lng/,
-    /lon/,
-    /coord/,
-    /^location$/,
-  ];
+  const blockedPatterns = [/^id$/, /_id$/, /uuid/, /guid/, /lat/, /lng/, /lon/, /coord/, /^location$/];
 
   const selected = preferred.filter((column) => availableColumns.has(column));
   const currentlySelected = new Set((plan.intent.columns || []).map((c) => c.toLowerCase()));
@@ -980,36 +1071,18 @@ function applyClientFriendlyProjection(
   });
 
   if (selected.length > 0) {
-    return {
-      ...plan,
-      intent: {
-        ...plan.intent,
-        columns: Array.from(new Set([...selected, ...keepExtra])).slice(0, 10),
-      },
-    };
+    return { ...plan, intent: { ...plan.intent, columns: Array.from(new Set([...selected, ...keepExtra])).slice(0, 10) } };
   }
 
   const fallbackColumns = Array.from(availableColumns).filter(
     (column) => !blockedPatterns.some((pattern) => pattern.test(column)),
   );
-
-  if (fallbackColumns.length === 0) {
-    return plan;
-  }
-
-  return {
-    ...plan,
-    intent: {
-      ...plan.intent,
-      columns: fallbackColumns.slice(0, 6),
-    },
-  };
+  if (fallbackColumns.length === 0) return plan;
+  return { ...plan, intent: { ...plan.intent, columns: fallbackColumns.slice(0, 6) } };
 }
 
 function dedupeRows(rows: Record<string, unknown>[]): Record<string, unknown>[] {
-  if (rows.length <= 1) {
-    return rows;
-  }
+  if (rows.length <= 1) return rows;
 
   const keys = Object.keys(rows[0] || {});
   const hasName = keys.some((key) => key.toLowerCase() === "name");
@@ -1023,15 +1096,9 @@ function dedupeRows(rows: Record<string, unknown>[]): Record<string, unknown>[] 
   const seen = new Set<string>();
 
   return rows.filter((row) => {
-    const fingerprint = stableKeys
-      .map((key) => String(row[key] ?? "").trim().toLowerCase())
-      .join("|");
-    if (!fingerprint) {
-      return true;
-    }
-    if (seen.has(fingerprint)) {
-      return false;
-    }
+    const fingerprint = stableKeys.map((key) => String(row[key] ?? "").trim().toLowerCase()).join("|");
+    if (!fingerprint) return true;
+    if (seen.has(fingerprint)) return false;
     seen.add(fingerprint);
     return true;
   });
@@ -1039,49 +1106,22 @@ function dedupeRows(rows: Record<string, unknown>[]): Record<string, unknown>[] 
 
 function isTechnicalKey(key: string): boolean {
   const lower = key.toLowerCase();
-  return (
-    lower === "id" ||
-    lower.endsWith("_id") ||
-    lower.includes("uuid") ||
-    lower.includes("guid") ||
-    lower.includes("coord") ||
-    lower.includes("lat") ||
-    lower.includes("lng") ||
-    lower.includes("lon")
-  );
+  return lower === "id" || lower.endsWith("_id") || lower.includes("uuid") ||
+    lower.includes("guid") || lower.includes("coord") || lower.includes("lat") ||
+    lower.includes("lng") || lower.includes("lon");
 }
 
-function sanitizeRowsForResponder(
-  rows: Record<string, unknown>[],
-  message: string,
-): Record<string, unknown>[] {
-  if (rows.length === 0) {
-    return rows;
-  }
-
+function sanitizeRowsForResponder(rows: Record<string, unknown>[], message: string): Record<string, unknown>[] {
+  if (rows.length === 0) return rows;
   const asksTechnical = includesAny(message, [
-    "id",
-    "uuid",
-    "guid",
-    "coordinate",
-    "coordinates",
-    "location",
-    "latitude",
-    "longitude",
-    "lat",
-    "lng",
+    "id", "uuid", "guid", "coordinate", "coordinates", "location", "latitude", "longitude", "lat", "lng",
   ]);
-
-  if (asksTechnical) {
-    return rows;
-  }
+  if (asksTechnical) return rows;
 
   return rows.map((row) => {
     const clean: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(row)) {
-      if (!isTechnicalKey(key)) {
-        clean[key] = value;
-      }
+      if (!isTechnicalKey(key)) clean[key] = value;
     }
     return Object.keys(clean).length > 0 ? clean : row;
   });
@@ -1105,10 +1145,7 @@ function findKeyCaseInsensitive(row: Record<string, unknown>, candidates: string
   return null;
 }
 
-function enrichRowsWithPriceRange(
-  rows: Record<string, unknown>[],
-  message: string,
-): Record<string, unknown>[] {
+function enrichRowsWithPriceRange(rows: Record<string, unknown>[], message: string): Record<string, unknown>[] {
   const asksPrice = includesAny(message, ["price", "prices", "prix", "tarif", "tarifs", "budget", "cost", "montant"]);
   if (!asksPrice || rows.length === 0) return rows;
 
@@ -1116,31 +1153,21 @@ function enrichRowsWithPriceRange(
     const minKey = findKeyCaseInsensitive(row, ["minprice", "min_price", "price_min", "prixmin"]);
     const maxKey = findKeyCaseInsensitive(row, ["maxprice", "max_price", "price_max", "prixmax"]);
     if (!minKey || !maxKey) return row;
-
     const minValue = toFiniteNumber(row[minKey]);
     const maxValue = toFiniteNumber(row[maxKey]);
     if (minValue === null || maxValue === null) return row;
-
     const low = Math.min(minValue, maxValue);
     const high = Math.max(minValue, maxValue);
-    return {
-      ...row,
-      price_range: `between ${low} and ${high}`,
-    };
+    return { ...row, price_range: `between ${low} and ${high}` };
   });
 }
 
 function looksLikeNoResultsAnswer(text: string): boolean {
   const lower = normalizeForParsing(text);
-  return (
-    lower.includes("no project") ||
-    lower.includes("no projects") ||
-    lower.includes("couldnt find") ||
-    lower.includes("could not find") ||
-    lower.includes("aucun projet") ||
-    lower.includes("pas de projet") ||
-    lower.includes("je nai pas trouve")
-  );
+  return lower.includes("no project") || lower.includes("no projects") ||
+    lower.includes("couldnt find") || lower.includes("could not find") ||
+    lower.includes("aucun projet") || lower.includes("pas de projet") ||
+    lower.includes("je nai pas trouve");
 }
 
 function firstExistingValue(row: Record<string, unknown>, keys: string[]): string | null {
@@ -1156,39 +1183,31 @@ function firstExistingValue(row: Record<string, unknown>, keys: string[]): strin
   return null;
 }
 
-function buildDeterministicRowsAnswer(
-  language: ChatLanguage,
-  rows: Record<string, unknown>[],
-): string {
+function buildDeterministicRowsAnswer(language: ChatLanguage, rows: Record<string, unknown>[], matchLevel?: string): string {
+  const prefix = matchLevel && matchLevel !== "exact"
+    ? language === "fr"
+      ? "Je n'ai pas trouve de correspondance exacte, mais voici les resultats les plus proches:\n"
+      : "I couldn't find an exact match, but here are the closest results:\n"
+    : language === "fr"
+      ? "Voici les projets trouves:\n"
+      : "Here are the projects found:\n";
+
   const picked = rows.slice(0, 5).map((row) => {
     const name = firstExistingValue(row, ["name", "project_name", "title"]) || "Project";
     const city = firstExistingValue(row, ["address", "city", "ville"]);
     const desc = firstExistingValue(row, ["description"]);
     const priceRange = firstExistingValue(row, ["price_range"]);
-
     const parts: string[] = [name];
-    if (city) {
-      parts.push(language === "fr" ? `a ${city}` : `in ${city}`);
-    }
-    if (priceRange) {
-      parts.push(language === "fr" ? `prix ${priceRange}` : `price ${priceRange}`);
-    }
-    if (desc) {
-      parts.push(desc);
-    }
+    if (city) parts.push(language === "fr" ? `a ${city}` : `in ${city}`);
+    if (priceRange) parts.push(language === "fr" ? `prix ${priceRange}` : `price ${priceRange}`);
+    if (desc) parts.push(desc);
     return `- ${parts.join(": ")}`;
   });
-
-  if (language === "fr") {
-    return `Voici les projets trouves:\n${picked.join("\n")}`;
-  }
-  return `Here are the projects found:\n${picked.join("\n")}`;
+  return `${prefix}${picked.join("\n")}`;
 }
 
 function coerceLanguage(language: unknown): ChatLanguage | null {
-  if (language === "en" || language === "fr") {
-    return language;
-  }
+  if (language === "en" || language === "fr") return language;
   return null;
 }
 
@@ -1200,7 +1219,6 @@ If uncertain, return {"language":"en"}.`,
     message,
     true,
   );
-
   try {
     const parsed = JSON.parse(response) as { language?: string };
     return parsed.language === "fr" ? "fr" : "en";
@@ -1247,7 +1265,7 @@ Rules:
 - Never invent table names or concepts.
 - Don't mind case sensitivity
 - filters must be [] when not needed.
-- If the user mentions “prix”, “price”, “budget”, “coût”, “cost”:
+- If the user mentions "prix", "price", "budget", "coût", "cost":
     Intent remains LOOKUP
     Include MinPrice and MaxPrice (or PRICE_RANGE concept)
     Do NOT switch to COUNT or AGGREGATE
@@ -1257,8 +1275,8 @@ Rules:
 - For intent=count, aggregation must be null.
 - For intent=aggregate, aggregation is required.
 - Deduplicate select concepts.
-- Only ignore values like “test”, “dummy”, “sample” WHEN they appear ALONE and NOT as part of a longer name.
-  If “test” is part of a multi-word entity name (e.g., “lilas test”), treat it as a valid name.
+- Only ignore values like "test", "dummy", "sample" WHEN they appear ALONE and NOT as part of a longer name.
+  If "test" is part of a multi-word entity name (e.g., "lilas test"), treat it as a valid name.
 - If both PROJECT_NAME and PROJECT_DESCRIPTION are redundant, keep PROJECT_NAME unless explicitly asked for description.
 - Allowed SQL operators for later execution context are: ${operators}.`;
 
@@ -1273,7 +1291,6 @@ ${normalizedMessage}`;
     try {
       return { parsed: JSON.parse(raw), raw };
     } catch {
-      // Let validation + repair flow handle malformed JSON.
       return { parsed: raw, raw };
     }
   }
@@ -1298,26 +1315,18 @@ Invalid JSON:
 ${plannerAttempt.raw}
 
 Return ONLY corrected JSON that satisfies the schema and constraints.`;
-
     plannerAttempt = await runPlanner(repairPrompt);
     plannerValidation = validatePlannerQueryPlan(plannerAttempt.parsed);
   }
 
   if (!plannerValidation.ok) {
-    const fallbackLanguage = language;
     return {
-      plannerLanguage: fallbackLanguage,
+      plannerLanguage: language,
       plannerStatus: "need_clarification",
-      askUser:
-        fallbackLanguage === "fr"
-          ? "Pouvez-vous preciser votre demande (ville, type de projet, ou statut) ?"
-          : "Could you clarify your request (city, project type, or status)?",
-      executablePlan: {
-      intent: { type: "lookup", table: "projects", columns: ["name"] },
-      filters: [],
-      limit: 10,
-      sort: undefined,
-      },
+      askUser: language === "fr"
+        ? "Pouvez-vous preciser votre demande (ville, type de projet, ou statut) ?"
+        : "Could you clarify your request (city, project type, or status)?",
+      executablePlan: { intent: { type: "lookup", table: "projects", columns: ["name"] }, filters: [], limit: 10, sort: undefined },
     };
   }
 
@@ -1338,19 +1347,14 @@ Return ONLY corrected JSON that satisfies the schema and constraints.`;
       : plannerPlan;
 
   const hintedSelection = applyConceptSelectionHints(
-    {
-      select: effectivePlannerPlan.select,
-      notes: effectivePlannerPlan.notes,
-    },
+    { select: effectivePlannerPlan.select, notes: effectivePlannerPlan.notes },
     normalizedMessage,
   );
   effectivePlannerPlan.select = hintedSelection.select;
   effectivePlannerPlan.notes = hintedSelection.notes;
 
   const tableMeta = allowlist.tables.get(effectivePlannerPlan.table.toLowerCase());
-  if (!tableMeta) {
-    throw new Error(`Planner selected unknown table "${effectivePlannerPlan.table}".`);
-  }
+  if (!tableMeta) throw new Error(`Planner selected unknown table "${effectivePlannerPlan.table}".`);
 
   const resolveConcept = (concept: PlannerConcept): string | null => {
     const candidates = tableMeta.conceptMap[concept] || [];
@@ -1364,22 +1368,15 @@ Return ONLY corrected JSON that satisfies the schema and constraints.`;
   const resolveConceptForSelect = (concept: PlannerConcept): string[] => {
     const candidates = tableMeta.conceptMap[concept] || [];
     if (candidates.length === 0) return [];
-
-    // For range-like business concepts (price/surface), include both min/max variants when present.
     if (concept === "PRICE" || concept === "SURFACE") {
       const ranged = candidates.filter((col) => /(min|max)/i.test(col));
-      if (ranged.length > 0) {
-        return Array.from(new Set([...ranged.slice(0, 2), candidates[0]]));
-      }
+      if (ranged.length > 0) return Array.from(new Set([...ranged.slice(0, 2), candidates[0]]));
     }
-
     return [candidates[0]];
   };
 
   const resolvedSelect = Array.from(
-    new Set(
-      effectivePlannerPlan.select.flatMap((concept) => resolveConceptForSelect(concept)),
-    ),
+    new Set(effectivePlannerPlan.select.flatMap((concept) => resolveConceptForSelect(concept))),
   );
 
   const resolvedFilters = effectivePlannerPlan.filters
@@ -1387,18 +1384,8 @@ Return ONLY corrected JSON that satisfies the schema and constraints.`;
       const column = resolveConcept(filter.concept);
       if (!column) return null;
       const mappedOperator =
-        filter.operator === "="
-          ? "eq"
-          : filter.operator === "!="
-            ? "neq"
-            : filter.operator === "IN"
-              ? "in"
-              : "contains";
-      return {
-        field: column,
-        operator: mappedOperator as QueryPlan["filters"][number]["operator"],
-        value: filter.value,
-      };
+        filter.operator === "=" ? "eq" : filter.operator === "!=" ? "neq" : filter.operator === "IN" ? "in" : "contains";
+      return { field: column, operator: mappedOperator as QueryPlan["filters"][number]["operator"], value: filter.value };
     })
     .filter((item): item is NonNullable<typeof item> => Boolean(item));
 
@@ -1406,10 +1393,7 @@ Return ONLY corrected JSON that satisfies the schema and constraints.`;
     .map((item) => {
       const column = resolveConcept(item.concept);
       if (!column) return null;
-      return {
-        field: column,
-        direction: item.direction,
-      };
+      return { field: column, direction: item.direction };
     })
     .filter((item): item is NonNullable<typeof item> => Boolean(item));
 
@@ -1425,10 +1409,7 @@ Return ONLY corrected JSON that satisfies the schema and constraints.`;
       columns: resolvedSelect.length > 0 ? resolvedSelect : undefined,
       aggregation:
         effectivePlannerPlan.intent === "aggregate" && effectivePlannerPlan.aggregation && aggregationColumn
-          ? {
-              func: effectivePlannerPlan.aggregation.func,
-              column: aggregationColumn,
-            }
+          ? { func: effectivePlannerPlan.aggregation.func, column: aggregationColumn }
           : undefined,
     },
     filters: resolvedFilters,
@@ -1437,14 +1418,10 @@ Return ONLY corrected JSON that satisfies the schema and constraints.`;
   };
 
   const shapeValidation = validateQueryPlan(executablePlan);
-  if (!shapeValidation.ok) {
-    throw new Error(`Invalid QueryPlan JSON: ${shapeValidation.errors.join(" ")}`);
-  }
+  if (!shapeValidation.ok) throw new Error(`Invalid QueryPlan JSON: ${shapeValidation.errors.join(" ")}`);
 
   const allowlistValidation = validateAgainstAllowlist(shapeValidation.plan, allowlist);
-  if (!allowlistValidation.ok) {
-    throw new Error(`QueryPlan rejected by allowlist: ${allowlistValidation.errors.join(" ")}`);
-  }
+  if (!allowlistValidation.ok) throw new Error(`QueryPlan rejected by allowlist: ${allowlistValidation.errors.join(" ")}`);
 
   return {
     plannerLanguage: plannerPlan.language,
@@ -1459,8 +1436,20 @@ async function generateAnswer(
   message: string,
   plan: QueryPlan,
   rows: Record<string, unknown>[],
+  matchLevel?: "exact" | "close" | "city" | "semantic" | "alternative",
 ): Promise<string> {
   const presentationRows = enrichRowsWithPriceRange(sanitizeRowsForResponder(rows, message), message);
+
+  const matchQualityHint = matchLevel && matchLevel !== "exact"
+    ? `\nIMPORTANT: The results below are NOT exact matches. Match quality level: "${matchLevel}".
+- If "close": results are approximate matches (e.g. fuzzy location or operator relaxation).
+- If "city": results are from the same city but may not match all criteria.
+- If "semantic": results are semantically similar but from a broader search.
+- If "alternative": these are the best available alternatives; clearly state they don't exactly match.
+You MUST mention this to the user clearly and helpfully. Do NOT present them as exact matches.
+Use phrasing like: "I couldn't find an exact match, but here are the closest results..." or the French equivalent.`
+    : "";
+
   const response = await queryAI(
     `You are a client-facing real-estate assistant.
 Reply in ${language === "fr" ? "French" : "English"}.
@@ -1468,6 +1457,7 @@ Use only the provided query results and never invent missing facts.
 Keep a warm, concise, professional tone.
 Do not mention SQL, query plans, allowlists, backend, internal validation, or system errors.
 Do not expose technical identifiers (id/uuid/coordinates) unless the user explicitly asked for them.
+${matchQualityHint}
 When there are results:
 - Prefer project name, address/city, and description when available.
 - If pricing columns include min/max variants (e.g. minprice/maxprice), always present price as a range:
@@ -1478,6 +1468,7 @@ When there are results:
 When there are no results:
 - Say this politely.
 - Suggest one concrete rephrasing in the same language.
+- Do NOT just say "please rephrase" -- give a specific helpful alternative query.
 Return JSON only with shape: {"answer":"string"}.`,
     `User question:
 ${message}
@@ -1494,7 +1485,7 @@ ${JSON.stringify(presentationRows)}`,
     const parsed = JSON.parse(response) as { answer?: string };
     if (typeof parsed.answer === "string" && parsed.answer.trim().length > 0) {
       if (rows.length > 0 && looksLikeNoResultsAnswer(parsed.answer)) {
-        return buildDeterministicRowsAnswer(language, presentationRows);
+        return buildDeterministicRowsAnswer(language, presentationRows, matchLevel);
       }
       return parsed.answer;
     }
@@ -1502,9 +1493,7 @@ ${JSON.stringify(presentationRows)}`,
     // Fall through.
   }
 
-  if (rows.length > 0) {
-    return buildDeterministicRowsAnswer(language, presentationRows);
-  }
+  if (rows.length > 0) return buildDeterministicRowsAnswer(language, presentationRows, matchLevel);
 
   return language === "fr"
     ? "Je n'ai pas pu formater une reponse claire, mais les resultats sont fournis."
@@ -1512,171 +1501,272 @@ ${JSON.stringify(presentationRows)}`,
 }
 
 export async function chat(message: string, requestedLanguage?: unknown): Promise<ChatResponse> {
-  const resolvedLanguage = coerceLanguage(requestedLanguage) ?? (await detectLanguage(message));
-  const allowlist = await loadSchemaAllowlist();
-  const presetExecution = await runPresetQuery(message);
-  if (presetExecution) {
-    const rows = dedupeRows(presetExecution.rows);
-    const answer = await generateAnswer(resolvedLanguage, message, presetExecution.plan, rows);
+  const conversationId = randomUUID();
+  try {
+    const resolvedLanguage = coerceLanguage(requestedLanguage) ?? (await detectLanguage(message));
+    const allowlist = await getCachedAllowlist();
+    const presetExecution = await runPresetQuery(message);
+    if (presetExecution) {
+      const rows = dedupeRows(presetExecution.rows);
+      const answer = await generateAnswer(resolvedLanguage, message, presetExecution.plan, rows, "exact");
+      const suggestions =
+        rows.length > 8
+          ? await buildChatSuggestions({
+              allowlist,
+              message,
+              language: resolvedLanguage,
+              tableKey: presetExecution.plan.intent.table,
+            })
+          : undefined;
+
+      return {
+        conversation_id: conversationId,
+        language: resolvedLanguage,
+        status: "ok",
+        answer,
+        suggestions,
+        queryPlan: presetExecution.plan,
+        results: rows,
+      };
+    }
+
+    // Handle broad/vague entity requests immediately without clarification
+    const broadEntity = detectBroadEntityRequest(message);
+    if (broadEntity) {
+      const broadExecution = await runBroadEntityQuery(broadEntity);
+      if (broadExecution && broadExecution.rows.length > 0) {
+        const rows = dedupeRows(broadExecution.rows);
+        const answer = await generateAnswer(resolvedLanguage, message, broadExecution.plan, rows, "exact");
+        const suggestions =
+          rows.length > 8
+            ? await buildChatSuggestions({
+                allowlist,
+                message,
+                language: resolvedLanguage,
+                tableKey: broadExecution.plan.intent.table,
+              })
+            : undefined;
+
+        return {
+          conversation_id: conversationId,
+          language: resolvedLanguage,
+          status: "ok",
+          answer,
+          suggestions,
+          queryPlan: broadExecution.plan,
+          results: rows,
+        };
+      }
+    }
+
+    const forcedPlan = buildForcedProjectsAddressPlan(message, allowlist);
+    const planning = forcedPlan
+      ? {
+          executablePlan: forcedPlan,
+          plannerLanguage: resolvedLanguage,
+          plannerStatus: "ok" as PlannerStatus,
+          askUser: null,
+        }
+      : await generateQueryPlan(message, resolvedLanguage, allowlist);
+    const plan = planning.executablePlan;
+
+    if (planning.plannerStatus !== "ok") {
+      // Before returning a clarification, try progressive fallback to find ANY useful results
+      const allowlistCheck = validateAgainstAllowlist(plan, allowlist);
+      if (allowlistCheck.ok) {
+        const fallbackResult = await progressiveFallbackSearch(plan, allowlistCheck.table, message, allowlist);
+        if (fallbackResult && fallbackResult.rows.length > 0) {
+          const answer = await generateAnswer(
+            planning.plannerLanguage,
+            message,
+            fallbackResult.plan,
+            fallbackResult.rows,
+            fallbackResult.matchLevel,
+          );
+          const suggestions = await buildChatSuggestions({
+            allowlist,
+            message,
+            language: planning.plannerLanguage,
+            tableKey: fallbackResult.plan.intent.table,
+          });
+          return {
+            conversation_id: conversationId,
+            language: planning.plannerLanguage,
+            status: "ok",
+            answer,
+            suggestions,
+            queryPlan: fallbackResult.plan,
+            results: fallbackResult.rows,
+          };
+        }
+      }
+
+      const lang = planning.plannerLanguage;
+      const fallbackQuestion = lang === "fr" ? "Pouvez-vous reformuler votre demande ?" : "Could you rephrase your request?";
+      const followUp = planning.askUser || fallbackQuestion;
+      const suggestions = await buildChatSuggestions({
+        allowlist,
+        message,
+        language: lang,
+        tableKey: plan.intent.table,
+      });
+      return {
+        conversation_id: conversationId,
+        language: lang,
+        status: planning.plannerStatus,
+        answer: followUp,
+        follow_up_question: followUp,
+        suggestions,
+        queryPlan: plan,
+        results: [],
+      };
+    }
+
+    const allowlistValidation = validateAgainstAllowlist(plan, allowlist);
+
+    if (!allowlistValidation.ok) {
+      throw new Error(`QueryPlan rejected by allowlist: ${allowlistValidation.errors.join(" ")}`);
+    }
+
+    const normalizedPlan = normalizeSemanticFilters(plan, allowlistValidation.table.columns, message);
+    const denoisedPlan = removeNoisyNameFilters(normalizedPlan, allowlistValidation.table.columns);
+    const deblockedPlan = removeAmbiguousAvailabilityFilters(denoisedPlan, allowlistValidation.table.columns);
+    const locationEnforcedPlan = enforceLocationFilterFromMessage(deblockedPlan, allowlistValidation.table.columns, message);
+    const directLocationPlan = applyDirectProjectLocationOverride(
+      locationEnforcedPlan,
+      allowlistValidation.table.columns,
+      message,
+    );
+    const adjustedPlan = applyClientFriendlyProjection(directLocationPlan, allowlistValidation.table.columns, message);
+    let executedPlan = adjustedPlan;
+    let matchLevel: "exact" | "close" | "city" | "semantic" | "alternative" = "exact";
+    let { sql, params } = compileQueryPlan(executedPlan, allowlistValidation.table);
+    let dbResult = await query(sql, params);
+    logSql("main", sql, params, dbResult.rows.length);
+    let rows = dedupeRows(dbResult.rows as Record<string, unknown>[]);
+
+    // If exact query returns no results, use progressive fallback
+    if (rows.length === 0) {
+      const fallbackResult = await progressiveFallbackSearch(
+        executedPlan,
+        allowlistValidation.table,
+        message,
+        allowlist,
+      );
+      if (fallbackResult) {
+        executedPlan = fallbackResult.plan;
+        rows = fallbackResult.rows;
+        matchLevel = fallbackResult.matchLevel;
+      }
+    }
+
+    const answer = await generateAnswer(resolvedLanguage, message, executedPlan, rows, matchLevel);
     const suggestions =
       rows.length > 8
         ? await buildChatSuggestions({
             allowlist,
             message,
             language: resolvedLanguage,
-            tableKey: presetExecution.plan.intent.table,
+            tableKey: executedPlan.intent.table,
           })
         : undefined;
 
     return {
+      conversation_id: conversationId,
       language: resolvedLanguage,
       status: "ok",
       answer,
       suggestions,
-      queryPlan: presetExecution.plan,
+      queryPlan: executedPlan,
       results: rows,
     };
-  }
-
-  const forcedPlan = buildForcedProjectsAddressPlan(message, allowlist);
-  const planning = forcedPlan
-    ? {
-        executablePlan: forcedPlan,
-        plannerLanguage: resolvedLanguage,
-        plannerStatus: "ok" as PlannerStatus,
-        askUser: null,
-      }
-    : await generateQueryPlan(message, resolvedLanguage, allowlist);
-  const plan = planning.executablePlan;
-  const broadRequest = shouldAutoListProjects(message);
-
-  if (planning.plannerStatus !== "ok" || broadRequest) {
-    const lang = planning.plannerLanguage;
-    const defaultCityQuestion =
-      lang === "fr" ? "D'accord — vous cherchez des projets dans quelle ville ?" : "Sure — which city are you interested in?";
-    const fallbackQuestion = lang === "fr" ? "Pouvez-vous reformuler votre demande ?" : "Could you rephrase your request?";
-    const followUp = broadRequest ? defaultCityQuestion : planning.askUser || fallbackQuestion;
-    const suggestions = await buildChatSuggestions({
-      allowlist,
-      message,
-      language: lang,
-      tableKey: plan.intent.table,
-    });
+  } catch (error) {
+    console.error("[chat] Unhandled error:", error);
+    const lang = coerceLanguage(requestedLanguage) ?? "en";
     return {
+      conversation_id: conversationId,
       language: lang,
-      status: broadRequest ? "need_clarification" : planning.plannerStatus,
-      answer: followUp,
-      follow_up_question: followUp,
-      suggestions,
-      queryPlan: plan,
+      status: "ok",
+      answer: lang === "fr"
+        ? "Désolé, une erreur est survenue. Veuillez reformuler votre question."
+        : "Sorry, an error occurred. Please try rephrasing your question.",
+      queryPlan: { intent: { type: "lookup", table: "projects" }, filters: [], limit: 10, sort: undefined },
       results: [],
     };
   }
-  const allowlistValidation = validateAgainstAllowlist(plan, allowlist);
+}
 
-  if (!allowlistValidation.ok) {
-    throw new Error(`QueryPlan rejected by allowlist: ${allowlistValidation.errors.join(" ")}`);
-  }
+function detectProjectCityRequest(message: string): { city: string | null; projectIntent: boolean } {
+  const city = extractCityTokenForForcedProjects(message);
+  const lower = normalizeForParsing(message);
+  const projectIntent = /(project|projects|projet|projets)/.test(lower) || Boolean(city);
+  return { city, projectIntent };
+}
 
-  const normalizedPlan = normalizeSemanticFilters(plan, allowlistValidation.table.columns, message);
-  const denoisedPlan = removeNoisyNameFilters(normalizedPlan, allowlistValidation.table.columns);
-  const deblockedPlan = removeAmbiguousAvailabilityFilters(denoisedPlan, allowlistValidation.table.columns);
-  const locationEnforcedPlan = enforceLocationFilterFromMessage(deblockedPlan, allowlistValidation.table.columns, message);
-  const directLocationPlan = applyDirectProjectLocationOverride(
-    locationEnforcedPlan,
-    allowlistValidation.table.columns,
-    message,
-  );
-  const adjustedPlan = applyClientFriendlyProjection(directLocationPlan, allowlistValidation.table.columns, message);
-  let executedPlan = adjustedPlan;
-  let { sql, params } = compileQueryPlan(executedPlan, allowlistValidation.table);
-  let dbResult = await query(sql, params);
-  logSql("main", sql, params, dbResult.rows.length);
-  let rows = dedupeRows(dbResult.rows as Record<string, unknown>[]);
+function quoteIdent(identifier: string): string {
+  return `[${identifier.replace(/]/g, "]]")}]`;
+}
 
-  if (rows.length === 0) {
-    const relaxed = buildRelaxedLocationPlan(executedPlan, allowlistValidation.table.columns, message);
-    if (relaxed) {
-      executedPlan = relaxed;
-      const retry = compileQueryPlan(executedPlan, allowlistValidation.table);
-      dbResult = await query(retry.sql, retry.params);
-      logSql("relaxed", retry.sql, retry.params, dbResult.rows.length);
-      rows = dedupeRows(dbResult.rows as Record<string, unknown>[]);
+function quoteTable(schema: string, table: string): string {
+  return `${quoteIdent(schema)}.${quoteIdent(table)}`;
+}
 
-      // Secondary fallback: try alternate textual location columns if still empty.
-      if (rows.length === 0) {
-        const firstLocationFilter = executedPlan.filters.find((f) => hasLocationLikeColumn(f.field));
-        if (firstLocationFilter) {
-          const alternatives = getAlternativeLocationColumns(allowlistValidation.table.columns, firstLocationFilter.field);
-          for (const altCol of alternatives) {
-            const altPlan: QueryPlan = {
-              ...executedPlan,
-              filters: executedPlan.filters.map((f) =>
-                f === firstLocationFilter ? { ...f, field: altCol, operator: "contains" } : f,
-              ),
-            };
-            const altQuery = compileQueryPlan(altPlan, allowlistValidation.table);
-            const altResult = await query(altQuery.sql, altQuery.params);
-            logSql(`alt-column:${altCol}`, altQuery.sql, altQuery.params, altResult.rows.length);
-            const altRows = dedupeRows(altResult.rows as Record<string, unknown>[]);
-            if (altRows.length > 0) {
-              executedPlan = altPlan;
-              rows = altRows;
-              break;
-            }
-          }
-        }
-      }
+async function runProjectCityRescueLookup(
+  message: string,
+  allowlist: SchemaAllowlist,
+): Promise<{ plan: QueryPlan; rows: Record<string, unknown>[] } | null> {
+  const intent = detectProjectCityRequest(message);
+  if (!intent.projectIntent || !intent.city) return null;
+
+  const candidates = Array.from(allowlist.tables.entries())
+    .filter(([, table]) => {
+      return ["name", "project_name", "title", "nom"].some((c) => table.columns.has(c)) &&
+        getRankedLocationColumns(table.columns).length > 0;
+    })
+    .sort(([aKey], [bKey]) => {
+      const score = (key: string): number => {
+        if (key === "projects") return 100;
+        if (/project|projet/i.test(key)) return 70;
+        return 10;
+      };
+      return score(bKey) - score(aKey);
+    });
+
+  for (const [tableKey, table] of candidates) {
+    const locationCols = getRankedLocationColumns(table.columns).slice(0, 4);
+    if (locationCols.length === 0) continue;
+
+    const selectedColumns = [
+      "name", "project_name", "title", ...locationCols,
+      "description", "status", "minprice", "maxprice",
+    ].filter((col, idx, arr) => table.columns.has(col) && arr.indexOf(col) === idx);
+
+    const whereParts: string[] = [];
+    const params: Array<string | number | boolean | Date | null> = [];
+    for (const col of locationCols) {
+      const ref = `@p${params.length}`;
+      params.push(`%${intent.city}%`);
+      whereParts.push(`LOWER(CAST(${quoteIdent(col)} AS NVARCHAR(4000))) LIKE LOWER(CAST(${ref} AS NVARCHAR(4000)))`);
     }
+
+    const sql = `SELECT TOP (50) ${selectedColumns.length > 0 ? selectedColumns.map(quoteIdent).join(", ") : "*"}
+FROM ${quoteTable(table.schema, table.table)}
+WHERE (${whereParts.join(" OR ")});`;
+
+    const result = await query(sql, params);
+    logSql(`rescue:${tableKey}`, sql, params, result.rows.length);
+    const rows = dedupeRows(result.rows as Record<string, unknown>[]);
+    if (rows.length === 0) continue;
+
+    return {
+      plan: {
+        intent: { type: "lookup", table: tableKey, columns: selectedColumns.length > 0 ? selectedColumns : undefined },
+        filters: [{ field: locationCols[0], operator: "contains", value: intent.city }],
+        limit: 50,
+        sort: undefined,
+      },
+      rows,
+    };
   }
-
-  if (rows.length === 0) {
-    const cityFallbackPlans = buildCityFallbackPlans(message, allowlist);
-    for (const candidatePlan of cityFallbackPlans) {
-      const candidateAllowlist = validateAgainstAllowlist(candidatePlan, allowlist);
-      if (!candidateAllowlist.ok) continue;
-      const candidateQuery = compileQueryPlan(candidatePlan, candidateAllowlist.table);
-      const candidateResult = await query(candidateQuery.sql, candidateQuery.params);
-      logSql(
-        `city-fallback:${candidatePlan.intent.table}:${candidatePlan.filters[0]?.field || "none"}`,
-        candidateQuery.sql,
-        candidateQuery.params,
-        candidateResult.rows.length,
-      );
-      const candidateRows = dedupeRows(candidateResult.rows as Record<string, unknown>[]);
-      if (candidateRows.length > 0) {
-        executedPlan = candidatePlan;
-        rows = candidateRows;
-        break;
-      }
-    }
-  }
-
-  if (rows.length === 0) {
-    const rescued = await runProjectCityRescueLookup(message, allowlist);
-    if (rescued) {
-      executedPlan = rescued.plan;
-      rows = rescued.rows;
-    }
-  }
-
-  const answer = await generateAnswer(resolvedLanguage, message, executedPlan, rows);
-  const suggestions =
-    rows.length > 8
-      ? await buildChatSuggestions({
-          allowlist,
-          message,
-          language: resolvedLanguage,
-          tableKey: executedPlan.intent.table,
-        })
-      : undefined;
-
-  return {
-    language: resolvedLanguage,
-    status: "ok",
-    answer,
-    suggestions,
-    queryPlan: executedPlan,
-    results: rows,
-  };
+  return null;
 }
