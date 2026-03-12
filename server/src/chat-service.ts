@@ -1,4 +1,4 @@
-import { loadSchemaAllowlist, renderAllowlistForPrompt } from "./allowlist";
+﻿import { loadSchemaAllowlist, renderAllowlistForPrompt } from "./allowlist";
 import { queryAI } from "./query-ai";
 import { query } from "./db";
 import { buildChatSuggestions, SuggestionChip } from "./suggestions";
@@ -21,6 +21,9 @@ interface ChatResponse {
   answer: string;
   follow_up_question?: string;
   suggestions?: SuggestionChip[];
+  conversation_status?: "normal" | "qualifying" | "lead_capture" | "appointment_ready";
+  required_fields?: Array<"name" | "phone" | "email" | "availability">;
+  projects?: ProjectCard[];
   queryPlan: QueryPlan;
   results: Record<string, unknown>[];
 }
@@ -35,6 +38,36 @@ interface PlannerOutcome {
 interface PresetExecution {
   plan: QueryPlan;
   rows: Record<string, unknown>[];
+}
+
+interface ProjectCard {
+  id?: number;
+  name: string;
+  city?: string;
+  description?: string;
+  price_range?: string;
+  images: string[];
+}
+
+interface LeadInfo {
+  name?: string;
+  phone?: string;
+  email?: string;
+  availability?: string;
+  appointmentDateIso?: string;
+}
+
+interface ConversationState {
+  language: ChatLanguage;
+  mode: "normal" | "lead_capture";
+  city?: string;
+  budget?: number;
+  bedrooms?: number;
+  features: string[];
+  selectedProject?: string;
+  selectedProjectId?: number;
+  wantsVisit?: boolean;
+  lead: LeadInfo;
 }
 
 const TECHNICAL_COLUMN_PATTERNS = [
@@ -60,6 +93,12 @@ const KNOWN_CITY_TOKENS = new Set([
 ]);
 
 const DEBUG_SQL = process.env.DEBUG_SQL === "true";
+const conversationStore = new Map<string, ConversationState>();
+const EMPTY_PLAN: QueryPlan = {
+  intent: { type: "lookup", table: "projects", columns: ["name"] },
+  filters: [],
+  limit: 10,
+};
 
 function logSql(tag: string, sql: string, params: unknown[], rows?: number): void {
   if (!DEBUG_SQL) return;
@@ -68,6 +107,495 @@ function logSql(tag: string, sql: string, params: unknown[], rows?: number): voi
   if (typeof rows === "number") {
     console.log(`[SQL:${tag}:rows] ${rows}`);
   }
+}
+
+function getConversationState(sessionId: string, language: ChatLanguage): ConversationState {
+  const existing = conversationStore.get(sessionId);
+  if (existing) {
+    return existing;
+  }
+
+  const fresh: ConversationState = {
+    language,
+    mode: "normal",
+    features: [],
+    lead: {},
+  };
+  conversationStore.set(sessionId, fresh);
+  return fresh;
+}
+
+function isStrongEnglishMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+  if (lower.trim().length < 4) return false;
+  return includesAny(lower, [
+    " i ",
+    " i'm ",
+    " i am ",
+    " show me ",
+    " what ",
+    " where ",
+    " which ",
+    " budget ",
+    " bedroom",
+    " project",
+    " please",
+    " can you",
+    " available",
+  ]);
+}
+
+function isStrongFrenchMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+  if (lower.trim().length < 3) return false;
+  return includesAny(lower, [
+    " je ",
+    " j'",
+    "vous",
+    "projet",
+    "ville",
+    "budget",
+    "chambre",
+    "bonjour",
+    "salut",
+    "disponible",
+    "pouvez-vous",
+    "montre",
+    "cherche",
+  ]);
+}
+
+async function resolveChatLanguage(
+  message: string,
+  requestedLanguage: unknown,
+  existingState: ConversationState | undefined,
+): Promise<ChatLanguage> {
+  const explicit = coerceLanguage(requestedLanguage);
+  if (explicit) return explicit;
+
+  if (!existingState) {
+    return detectLanguage(message);
+  }
+
+  const english = isStrongEnglishMessage(` ${message} `);
+  const french = isStrongFrenchMessage(` ${message} `);
+
+  if (english && !french) return "en";
+  if (french && !english) return "fr";
+  return existingState.language;
+}
+
+function extractBudget(message: string): number | null {
+  const normalized = message.toLowerCase().replace(/,/g, "").replace(/\s+/g, " ");
+  const match = normalized.match(/(\d{3,7})(\s?(k|m|dh|mad))?/i);
+  if (!match) return null;
+  const raw = Number(match[1]);
+  if (!Number.isFinite(raw)) return null;
+  const unit = (match[3] || "").toLowerCase();
+  if (unit === "k") return raw * 1000;
+  if (unit === "m") return raw * 1000000;
+  return raw;
+}
+
+function extractBedrooms(message: string): number | null {
+  const normalized = message.toLowerCase();
+  const match = normalized.match(/(\d+)\s*(bed|beds|bedroom|bedrooms|chambre|chambres|pieces|rooms)/i);
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isInteger(value) && value > 0 && value < 10 ? value : null;
+}
+
+function extractFeatureTags(message: string): string[] {
+  const lower = message.toLowerCase();
+  const tags: string[] = [];
+  if (includesAny(lower, ["garden", "jardin"])) tags.push("garden");
+  if (includesAny(lower, ["pool", "piscine"])) tags.push("pool");
+  if (includesAny(lower, ["secure", "securise", "sÃ©curisÃ©", "residence securisee", "rÃ©sidence sÃ©curisÃ©e"])) {
+    tags.push("secure_residence");
+  }
+  return tags;
+}
+
+function detectVisitIntent(message: string): boolean {
+  return includesAny(message.toLowerCase(), [
+    "visit",
+    "visite",
+    "rendez-vous",
+    "rendez vous",
+    "rdv",
+    "appointment",
+    "prendre rendez",
+    "book",
+    "reserve",
+    "rÃ©server",
+    "planifier",
+    "schedule",
+    "see this project",
+    "interested",
+    "interesse",
+    "intÃ©ressÃ©",
+  ]);
+}
+
+function detectBroadHousingIntent(message: string): boolean {
+  return includesAny(message.toLowerCase(), [
+    "project",
+    "projects",
+    "projet",
+    "projets",
+    "apartment",
+    "appartement",
+    "immeuble",
+    "residence",
+    "rÃ©sidence",
+  ]);
+}
+
+function buildQualificationQuestion(language: ChatLanguage, field: "city" | "budget" | "bedrooms" | "features"): string {
+  if (language === "fr") {
+    if (field === "city") return "Dans quelle ville cherchez-vous votre bien ?";
+    if (field === "budget") return "Quel est votre budget approximatif ?";
+    if (field === "bedrooms") return "Vous souhaitez combien de chambres ?";
+    return "Avez-vous des criteres specifiques (jardin, piscine, residence securisee) ?";
+  }
+
+  if (field === "city") return "Which city are you looking in?";
+  if (field === "budget") return "What is your approximate budget?";
+  if (field === "bedrooms") return "How many bedrooms do you need?";
+  return "Do you have preferred features (garden, pool, secure residence)?";
+}
+
+function buildQualificationChips(language: ChatLanguage, field: "city" | "budget" | "bedrooms" | "features"): SuggestionChip[] {
+  if (field === "city") {
+    return language === "fr"
+      ? [
+          { label: "Casablanca", payload: "projets a casablanca", type: "city" },
+          { label: "Rabat", payload: "projets a rabat", type: "city" },
+        ]
+      : [
+          { label: "Casablanca", payload: "projects in casablanca", type: "city" },
+          { label: "Rabat", payload: "projects in rabat", type: "city" },
+        ];
+  }
+  if (field === "budget") {
+    return language === "fr"
+      ? [
+          { label: "< 1M MAD", payload: "budget 1000000 mad", type: "budget" },
+          { label: "1M - 2M MAD", payload: "budget 1500000 mad", type: "budget" },
+        ]
+      : [
+          { label: "< 1M MAD", payload: "budget 1000000 mad", type: "budget" },
+          { label: "1M - 2M MAD", payload: "budget 1500000 mad", type: "budget" },
+        ];
+  }
+  if (field === "bedrooms") {
+    return [
+      { label: "2 bedrooms", payload: "2 bedrooms", type: "bedrooms" },
+      { label: "3 bedrooms", payload: "3 bedrooms", type: "bedrooms" },
+    ];
+  }
+  return language === "fr"
+    ? [
+        { label: "Jardin", payload: "je veux jardin", type: "feature" },
+        { label: "Piscine", payload: "je veux piscine", type: "feature" },
+        { label: "Residence securisee", payload: "je veux residence securisee", type: "feature" },
+      ]
+    : [
+        { label: "Garden", payload: "i want garden", type: "feature" },
+        { label: "Pool", payload: "i want pool", type: "feature" },
+        { label: "Secure residence", payload: "i want secure residence", type: "feature" },
+      ];
+}
+
+function requiredQualificationField(state: ConversationState): "city" | "budget" | "bedrooms" | "features" | null {
+  if (!state.city) return "city";
+  if (!state.budget) return "budget";
+  if (!state.bedrooms) return "bedrooms";
+  if (state.features.length === 0) return "features";
+  return null;
+}
+
+function buildPostResultFollowUp(
+  language: ChatLanguage,
+  message: string,
+  state: ConversationState,
+  hasRows: boolean,
+): { followUpQuestion?: string; conversationStatus: ChatResponse["conversation_status"] } {
+  let followUpQuestion: string | undefined;
+  let conversationStatus: ChatResponse["conversation_status"] = "normal";
+
+  if (!hasRows) {
+    return { followUpQuestion, conversationStatus };
+  }
+
+  if (state.wantsVisit || detectVisitIntent(message)) {
+    state.mode = "lead_capture";
+    followUpQuestion =
+      language === "fr"
+        ? "Souhaitez-vous planifier une visite sur place ?"
+        : "Would you like to schedule an on-site visit?";
+    conversationStatus = "lead_capture";
+    return { followUpQuestion, conversationStatus };
+  }
+
+  if (detectBroadHousingIntent(message)) {
+    const nextField = requiredQualificationField(state);
+    if (nextField && nextField !== "city") {
+      followUpQuestion = buildQualificationQuestion(language, nextField);
+      conversationStatus = "qualifying";
+      return { followUpQuestion, conversationStatus };
+    }
+  }
+
+  followUpQuestion =
+    language === "fr"
+      ? "Si vous souhaitez plus d'informations ou une visite sur place, nous pouvons planifier un rendez-vous avec l'un de nos agents."
+      : "If you need more information or a live tour, we can schedule an appointment with one of our agents.";
+  return { followUpQuestion, conversationStatus };
+}
+
+function extractLeadName(message: string): string | null {
+  const cleaned = message.trim().replace(/\s+/g, " ");
+  if (!cleaned) return null;
+
+  const explicit =
+    cleaned.match(/(?:my name is|i am|je m'appelle|je suis)\s+([A-Za-z\u00C0-\u017F' -]{4,60})/i) ||
+    cleaned.match(/^(?:nom complet|full name)\s*[:\-]\s*([A-Za-z\u00C0-\u017F' -]{4,60})$/i);
+  const candidate = (explicit?.[1] || cleaned).trim();
+  const lowered = normalizeForParsing(candidate);
+
+  const bannedTokens = [
+    "rendez",
+    "visite",
+    "appointment",
+    "possible",
+    "ok",
+    "bonjour",
+    "salut",
+    "merci",
+    "demain",
+    "lundi",
+    "mardi",
+    "mercredi",
+    "jeudi",
+    "vendredi",
+    "samedi",
+    "dimanche",
+    "email",
+    "telephone",
+    "phone",
+  ];
+  if (bannedTokens.some((t) => lowered.includes(t))) return null;
+
+  const parts = candidate.split(" ").filter((p) => /^[A-Za-z\u00C0-\u017F'-]{2,}$/.test(p));
+  if (parts.length < 2 || parts.length > 4) return null;
+
+  const normalized = parts.join(" ");
+  return normalized.length >= 5 && normalized.length <= 60 ? normalized : null;
+}
+
+function extractLeadPhone(message: string): string | null {
+  const match = message.match(/(\+?\d[\d\s-]{7,}\d)/);
+  if (!match) return null;
+  const normalized = match[1].replace(/\s+/g, " ").trim();
+  const digits = normalized.replace(/\D/g, "");
+  if (digits.length < 9 || digits.length > 15) return null;
+  return normalized;
+}
+
+function extractLeadEmail(message: string): string | null {
+  const match = message.match(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i);
+  return match ? match[0].trim() : null;
+}
+
+function parseHourMinute(text: string): { hour: number; minute: number } | null {
+  const hm = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(h|heure|heures)?\b/i);
+  if (!hm) return null;
+  const hour = Number(hm[1]);
+  const minute = hm[2] ? Number(hm[2]) : 0;
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  return { hour, minute };
+}
+
+function parseFrenchOrEnglishWeekday(text: string): number | null {
+  const lower = normalizeForParsing(text);
+  const map: Array<{ terms: string[]; day: number }> = [
+    { terms: ["lundi", "monday"], day: 1 },
+    { terms: ["mardi", "tuesday"], day: 2 },
+    { terms: ["mercredi", "wednesday"], day: 3 },
+    { terms: ["jeudi", "thursday"], day: 4 },
+    { terms: ["vendredi", "friday"], day: 5 },
+    { terms: ["samedi", "saturday"], day: 6 },
+    { terms: ["dimanche", "sunday"], day: 0 },
+  ];
+
+  for (const entry of map) {
+    if (entry.terms.some((t) => lower.includes(t))) return entry.day;
+  }
+  return null;
+}
+
+function getNextWeekdayDate(targetDay: number): Date {
+  const now = new Date();
+  const date = new Date(now);
+  date.setHours(0, 0, 0, 0);
+  const diff = (targetDay - date.getDay() + 7) % 7 || 7;
+  date.setDate(date.getDate() + diff);
+  return date;
+}
+
+function parseAvailabilityCandidate(message: string): Date | null {
+  const trimmed = message.trim();
+  if (!trimmed) return null;
+
+  const direct = Date.parse(trimmed);
+  if (Number.isFinite(direct)) {
+    return new Date(direct);
+  }
+
+  const frDateTime = trimmed.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b(?:\s+|.*?\b)(\d{1,2})(?::(\d{2}))?/);
+  if (frDateTime) {
+    const day = Number(frDateTime[1]);
+    const month = Number(frDateTime[2]) - 1;
+    const year = Number(frDateTime[3]);
+    const hour = Number(frDateTime[4]);
+    const minute = frDateTime[5] ? Number(frDateTime[5]) : 0;
+    const dt = new Date(year, month, day, hour, minute, 0, 0);
+    if (Number.isFinite(dt.getTime())) return dt;
+  }
+
+  const weekday = parseFrenchOrEnglishWeekday(trimmed);
+  const hm = parseHourMinute(trimmed);
+  if (weekday !== null && hm) {
+    const next = getNextWeekdayDate(weekday);
+    next.setHours(hm.hour, hm.minute, 0, 0);
+    return next;
+  }
+
+  return null;
+}
+
+function isAllowedAppointmentSlot(date: Date): boolean {
+  const day = date.getDay(); // 0=sun, 6=sat
+  if (day === 0 || day === 6) return false;
+
+  const minutes = date.getHours() * 60 + date.getMinutes();
+  const morningStart = 9 * 60;
+  const morningEnd = 12 * 60;
+  const afternoonStart = 14 * 60;
+  const afternoonEnd = 18 * 60;
+
+  const inMorning = minutes >= morningStart && minutes <= morningEnd;
+  const inAfternoon = minutes >= afternoonStart && minutes <= afternoonEnd;
+  return inMorning || inAfternoon;
+}
+
+function extractLeadAvailability(message: string): { raw: string; date: Date } | null {
+  if (
+    !includesAny(normalizeForParsing(message), [
+      "available",
+      "disponible",
+      "tomorrow",
+      "demain",
+      "monday",
+      "lundi",
+      "tuesday",
+      "mardi",
+      "wednesday",
+      "mercredi",
+      "thursday",
+      "jeudi",
+      "friday",
+      "vendredi",
+      "saturday",
+      "samedi",
+      "sunday",
+      "dimanche",
+      "h",
+      ":",
+      "/",
+    ])
+  ) {
+    return null;
+  }
+  const parsed = parseAvailabilityCandidate(message);
+  if (!parsed) return null;
+  return { raw: message.trim(), date: parsed };
+}
+
+function splitFullName(fullName: string): { firstName: string; lastName: string } {
+  const cleaned = fullName.trim().replace(/\s+/g, " ");
+  const parts = cleaned.split(" ");
+  if (parts.length <= 1) {
+    return { firstName: cleaned, lastName: "" };
+  }
+  return {
+    firstName: parts[0],
+    lastName: parts.slice(1).join(" "),
+  };
+}
+
+function parseAppointmentDate(raw: string | undefined): Date {
+  if (!raw) return new Date();
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) return new Date();
+  return new Date(parsed);
+}
+
+async function resolveProjectIdByName(projectName: string): Promise<number | null> {
+  const exactSql = `SELECT TOP (1) [Id] FROM [dbo].[Projects] WHERE LOWER(CAST([Name] AS NVARCHAR(4000))) = LOWER(CAST(@p0 AS NVARCHAR(4000)));`;
+  let result = await query(exactSql, [projectName.trim()]);
+  if (!result.rows?.length) {
+    const likeSql = `SELECT TOP (1) [Id] FROM [dbo].[Projects] WHERE LOWER(CAST([Name] AS NVARCHAR(4000))) LIKE LOWER(CAST(@p0 AS NVARCHAR(4000))) ORDER BY LEN(CAST([Name] AS NVARCHAR(4000))) ASC;`;
+    result = await query(likeSql, [`%${projectName.trim()}%`]);
+  }
+  const value = result.rows?.[0]?.Id;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+async function persistAppointment(state: ConversationState): Promise<void> {
+  const fullName = state.lead.name?.trim() || "Client";
+  const { firstName, lastName } = splitFullName(fullName);
+  const appointmentDate = state.lead.appointmentDateIso
+    ? new Date(state.lead.appointmentDateIso)
+    : parseAppointmentDate(state.lead.availability);
+
+  let projectId = state.selectedProjectId ?? null;
+  if (projectId === null && state.selectedProject) {
+    projectId = await resolveProjectIdByName(state.selectedProject);
+  }
+
+  const insertSql = `INSERT INTO [dbo].[Appointments]
+([ProjectId], [AppointmentDate], [Name], [LastName], [Email], [PhoneNumber], [Status], [PropertyType])
+VALUES (@p0, @p1, @p2, @p3, @p4, @p5, @p6, @p7);`;
+
+  const insertParams: Array<string | number | boolean | Date | null> = [
+    projectId,
+    appointmentDate,
+    firstName,
+    lastName || null,
+    state.lead.email || null,
+    state.lead.phone || null,
+    "Pending",
+    "project",
+  ];
+
+  // Preview mode by default: log the generated insert without writing to DB.
+  // Set APPOINTMENT_DRY_RUN=false to enable real inserts.
+  const dryRun = (process.env.APPOINTMENT_DRY_RUN || "true").toLowerCase() !== "false";
+  console.log("[appointments] SQL preview:", insertSql);
+  console.log("[appointments] SQL params:", JSON.stringify(insertParams));
+  if (dryRun) {
+    return;
+  }
+
+  await query(insertSql, insertParams);
 }
 
 function includesAny(text: string, terms: string[]): boolean {
@@ -518,7 +1046,7 @@ function applyDirectProjectLocationOverride(
   const lower = message.toLowerCase().trim();
   const looksLikeProjectLocationQuery =
     /(project|projects|projet|projets)/.test(lower) &&
-    /\b(in|a|au|à|dans)\b/.test(lower);
+    /\b(in|a|au|Ã |dans)\b/.test(lower);
 
   if (!looksLikeProjectLocationQuery) {
     return plan;
@@ -1130,6 +1658,55 @@ function enrichRowsWithPriceRange(
   });
 }
 
+function extractImageUrls(value: unknown): string[] {
+  if (value === null || value === undefined) return [];
+  const text = String(value).trim();
+  if (!text) return [];
+
+  // Handles single URL, comma-separated, or JSON-like arrays in a forgiving way.
+  const candidates = text
+    .replace(/[\[\]"]/g, "")
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  return candidates.filter((s) => /^https?:\/\//i.test(s)).slice(0, 5);
+}
+
+function mapRowsToProjectCards(rows: Record<string, unknown>[]): ProjectCard[] {
+  const cards: ProjectCard[] = [];
+  const seen = new Set<string>();
+
+  for (const row of rows) {
+    const idRaw = firstExistingValue(row, ["id"]);
+    const id = idRaw ? Number(idRaw) : undefined;
+    const name =
+      firstExistingValue(row, ["name", "projectname", "project_name", "title", "immeublename"]) || "Projet";
+    const city = firstExistingValue(row, ["address", "city", "ville", "location"]) || undefined;
+    const description = firstExistingValue(row, ["description"]) || undefined;
+    const minPrice = firstExistingValue(row, ["minprice"]);
+    const maxPrice = firstExistingValue(row, ["maxprice"]);
+    const priceRange = firstExistingValue(row, ["price_range"]) || (minPrice && maxPrice ? `between ${minPrice} and ${maxPrice}` : undefined);
+    const imageRaw = firstExistingValue(row, ["images", "imageprincipale"]);
+    const images = imageRaw ? extractImageUrls(imageRaw) : [];
+
+    const key = `${name.toLowerCase()}|${String(city || "").toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    cards.push({
+      id: Number.isFinite(id || NaN) ? id : undefined,
+      name,
+      city,
+      description,
+      price_range: priceRange,
+      images,
+    });
+  }
+
+  return cards.slice(0, 6);
+}
+
 function looksLikeNoResultsAnswer(text: string): boolean {
   const lower = normalizeForParsing(text);
   return (
@@ -1241,13 +1818,13 @@ Rules:
 - Use concept-first planning only. Never output raw column names.
 - Use schema ConceptMap to decide concepts.
 - LOCATION_CITY synonyms include: ville, city, casablanca, rabat, tanger, marrakech, agadir.
-- LOCATION_CITY → ["Ville", "City", "Location", "Adresse"]
+- LOCATION_CITY â†’ ["Ville", "City", "Location", "Adresse"]
 - LOCATION_TEXT synonyms include: adresse, address, quartier, zone, localisation, location, secteur, pres de, near, by.
 - Prefer LOCATION_CITY for city questions. Use LOCATION_TEXT for quartier/zone/near/by.
 - Never invent table names or concepts.
 - Don't mind case sensitivity
 - filters must be [] when not needed.
-- If the user mentions “prix”, “price”, “budget”, “coût”, “cost”:
+- If the user mentions â€œprixâ€, â€œpriceâ€, â€œbudgetâ€, â€œcoÃ»tâ€, â€œcostâ€:
     Intent remains LOOKUP
     Include MinPrice and MaxPrice (or PRICE_RANGE concept)
     Do NOT switch to COUNT or AGGREGATE
@@ -1257,8 +1834,8 @@ Rules:
 - For intent=count, aggregation must be null.
 - For intent=aggregate, aggregation is required.
 - Deduplicate select concepts.
-- Only ignore values like “test”, “dummy”, “sample” WHEN they appear ALONE and NOT as part of a longer name.
-  If “test” is part of a multi-word entity name (e.g., “lilas test”), treat it as a valid name.
+- Only ignore values like â€œtestâ€, â€œdummyâ€, â€œsampleâ€ WHEN they appear ALONE and NOT as part of a longer name.
+  If â€œtestâ€ is part of a multi-word entity name (e.g., â€œlilas testâ€), treat it as a valid name.
 - If both PROJECT_NAME and PROJECT_DESCRIPTION are redundant, keep PROJECT_NAME unless explicitly asked for description.
 - Allowed SQL operators for later execution context are: ${operators}.`;
 
@@ -1472,8 +2049,8 @@ When there are results:
 - Prefer project name, address/city, and description when available.
 - If pricing columns include min/max variants (e.g. minprice/maxprice), always present price as a range:
   "between {min} and {max}" (or use provided price_range field if present).
-- Present multiple items as a clean list with one item per line.
-- Use bullets with "-" for each item, not one long paragraph.
+- Present results as short, natural paragraphs (not bullet lists).
+- Keep phrasing commercial and client-friendly.
 - If there are many rows, provide a compact summary plus 2-5 representative examples.
 When there are no results:
 - Say this politely.
@@ -1511,12 +2088,173 @@ ${JSON.stringify(presentationRows)}`,
     : "I could not format a clear answer, but the query results are provided.";
 }
 
-export async function chat(message: string, requestedLanguage?: unknown): Promise<ChatResponse> {
-  const resolvedLanguage = coerceLanguage(requestedLanguage) ?? (await detectLanguage(message));
+export async function chat(message: string, requestedLanguage?: unknown, sessionId: string = "default"): Promise<ChatResponse> {
+  const existingState = conversationStore.get(sessionId);
+  const resolvedLanguage = await resolveChatLanguage(message, requestedLanguage, existingState);
+  const state = getConversationState(sessionId, resolvedLanguage);
+  state.language = resolvedLanguage;
+  const extractedCity = extractLikelyLocationTerm(message);
+  if (extractedCity) state.city = extractedCity;
+  const extractedBudget = extractBudget(message);
+  if (extractedBudget) state.budget = extractedBudget;
+  const extractedBedrooms = extractBedrooms(message);
+  if (extractedBedrooms) state.bedrooms = extractedBedrooms;
+  const extractedFeatures = extractFeatureTags(message);
+  if (extractedFeatures.length > 0) {
+    state.features = Array.from(new Set([...state.features, ...extractedFeatures]));
+  }
+
+  if (detectVisitIntent(message)) {
+    state.wantsVisit = true;
+    state.mode = "lead_capture";
+  }
+
+  if (state.mode === "lead_capture") {
+    if (!state.lead.name) {
+      const name = extractLeadName(message);
+      if (name) {
+        state.lead.name = name;
+      }
+    }
+    if (!state.lead.phone) {
+      const phone = extractLeadPhone(message);
+      if (phone) {
+        state.lead.phone = phone;
+      }
+    }
+    if (!state.lead.email) {
+      const email = extractLeadEmail(message);
+      if (email) {
+        state.lead.email = email;
+      }
+    }
+
+    if (!state.lead.name || !state.lead.phone) {
+      const missing: Array<"name" | "phone" | "email" | "availability"> = [];
+      if (!state.lead.name) missing.push("name");
+      if (!state.lead.phone) missing.push("phone");
+      missing.push("email", "availability");
+      return {
+        language: resolvedLanguage,
+        status: "need_clarification",
+        conversation_status: "lead_capture",
+        required_fields: missing,
+        answer:
+          resolvedLanguage === "fr"
+            ? "Parfait. Pour organiser la visite, merci de partager votre nom complet et votre numero de telephone."
+            : "Great. To schedule the visit, please share your full name and phone number.",
+        queryPlan: EMPTY_PLAN,
+        results: [],
+      };
+    }
+
+    if (!state.lead.email) {
+      return {
+        language: resolvedLanguage,
+        status: "need_clarification",
+        conversation_status: "lead_capture",
+        required_fields: ["email", "availability"],
+        answer:
+          resolvedLanguage === "fr"
+            ? "Merci. Pouvez-vous aussi partager votre adresse email ?"
+            : "Thank you. Could you also share your email address?",
+        queryPlan: EMPTY_PLAN,
+        results: [],
+      };
+    }
+
+    if (!state.lead.availability) {
+      const availability = extractLeadAvailability(message);
+      if (availability) {
+        if (!isAllowedAppointmentSlot(availability.date)) {
+          return {
+            language: resolvedLanguage,
+            status: "need_clarification",
+            conversation_status: "lead_capture",
+            required_fields: ["availability"],
+            answer:
+              resolvedLanguage === "fr"
+                ? "Les rendez-vous sont disponibles du lundi au vendredi, de 9h a 12h et de 14h a 18h. Merci de proposer un autre creneau."
+                : "Appointments are available Monday to Friday, from 9:00 to 12:00 and 14:00 to 18:00. Please propose another slot.",
+            queryPlan: EMPTY_PLAN,
+            results: [],
+          };
+        }
+        state.lead.availability = availability.raw;
+        state.lead.appointmentDateIso = availability.date.toISOString();
+      } else {
+        return {
+          language: resolvedLanguage,
+          status: "need_clarification",
+          conversation_status: "lead_capture",
+          required_fields: ["availability"],
+          answer:
+            resolvedLanguage === "fr"
+              ? "Parfait. Merci d'indiquer un creneau de visite (jour et heure) entre lundi-vendredi, 9h-12h ou 14h-18h."
+              : "Perfect. Please provide a visit slot (day and time) between Monday-Friday, 9:00-12:00 or 14:00-18:00.",
+          queryPlan: EMPTY_PLAN,
+          results: [],
+        };
+      }
+    }
+
+    state.mode = "normal";
+    try {
+      await persistAppointment(state);
+    } catch (error) {
+      console.error("[appointments] Failed to persist appointment", error);
+      return {
+        language: resolvedLanguage,
+        status: "need_clarification",
+        conversation_status: "lead_capture",
+        required_fields: ["availability"],
+        answer:
+          resolvedLanguage === "fr"
+            ? "Je n'ai pas pu enregistrer le rendez-vous pour le moment. Pouvez-vous confirmer votre disponibilite (jour et heure) ?"
+            : "I could not save the appointment right now. Could you confirm your availability (day and time)?",
+        queryPlan: EMPTY_PLAN,
+        results: [],
+      };
+    }
+    return {
+      language: resolvedLanguage,
+      status: "ok",
+      conversation_status: "appointment_ready",
+      answer:
+        resolvedLanguage === "fr"
+          ? `Merci ${state.lead.name}. Nous avons bien note votre demande${state.selectedProject ? ` pour ${state.selectedProject}` : ""}. Un agent immobilier vous appellera au ${state.lead.phone} et vous confirmera le rendez-vous (email: ${state.lead.email}, disponibilite: ${state.lead.availability}).`
+          : `Thank you ${state.lead.name}. We have recorded your request${state.selectedProject ? ` for ${state.selectedProject}` : ""}. A real estate agent will call you at ${state.lead.phone} to confirm the appointment (email: ${state.lead.email}, availability: ${state.lead.availability}).`,
+      queryPlan: EMPTY_PLAN,
+      results: [],
+    };
+  }
+
+  if (detectBroadHousingIntent(message)) {
+    const nextField = requiredQualificationField(state);
+    if (nextField === "city") {
+      return {
+        language: resolvedLanguage,
+        status: "need_clarification",
+        conversation_status: "qualifying",
+        answer: buildQualificationQuestion(resolvedLanguage, nextField),
+        suggestions: buildQualificationChips(resolvedLanguage, nextField),
+        queryPlan: EMPTY_PLAN,
+        results: [],
+      };
+    }
+  }
+
   const allowlist = await loadSchemaAllowlist();
   const presetExecution = await runPresetQuery(message);
   if (presetExecution) {
     const rows = dedupeRows(presetExecution.rows);
+    const projectCards = mapRowsToProjectCards(enrichRowsWithPriceRange(rows, message));
+    if (!state.selectedProject && projectCards.length > 0) {
+      state.selectedProject = projectCards[0].name;
+      if (typeof projectCards[0].id === "number") {
+        state.selectedProjectId = projectCards[0].id;
+      }
+    }
     const answer = await generateAnswer(resolvedLanguage, message, presetExecution.plan, rows);
     const suggestions =
       rows.length > 8
@@ -1528,11 +2266,21 @@ export async function chat(message: string, requestedLanguage?: unknown): Promis
           })
         : undefined;
 
+    const { followUpQuestion, conversationStatus } = buildPostResultFollowUp(
+      resolvedLanguage,
+      message,
+      state,
+      rows.length > 0,
+    );
+
     return {
       language: resolvedLanguage,
       status: "ok",
       answer,
+      follow_up_question: followUpQuestion,
       suggestions,
+      conversation_status: conversationStatus,
+      projects: projectCards,
       queryPlan: presetExecution.plan,
       results: rows,
     };
@@ -1553,7 +2301,7 @@ export async function chat(message: string, requestedLanguage?: unknown): Promis
   if (planning.plannerStatus !== "ok" || broadRequest) {
     const lang = planning.plannerLanguage;
     const defaultCityQuestion =
-      lang === "fr" ? "D'accord — vous cherchez des projets dans quelle ville ?" : "Sure — which city are you interested in?";
+      lang === "fr" ? "D'accord â€” vous cherchez des projets dans quelle ville ?" : "Sure â€” which city are you interested in?";
     const fallbackQuestion = lang === "fr" ? "Pouvez-vous reformuler votre demande ?" : "Could you rephrase your request?";
     const followUp = broadRequest ? defaultCityQuestion : planning.askUser || fallbackQuestion;
     const suggestions = await buildChatSuggestions({
@@ -1568,6 +2316,7 @@ export async function chat(message: string, requestedLanguage?: unknown): Promis
       answer: followUp,
       follow_up_question: followUp,
       suggestions,
+      conversation_status: "qualifying",
       queryPlan: plan,
       results: [],
     };
@@ -1661,6 +2410,19 @@ export async function chat(message: string, requestedLanguage?: unknown): Promis
   }
 
   const answer = await generateAnswer(resolvedLanguage, message, executedPlan, rows);
+  const projectCards = mapRowsToProjectCards(enrichRowsWithPriceRange(rows, message));
+  if (!state.selectedProject && projectCards.length > 0) {
+    state.selectedProject = projectCards[0].name;
+    if (typeof projectCards[0].id === "number") {
+      state.selectedProjectId = projectCards[0].id;
+    }
+  }
+  const { followUpQuestion, conversationStatus } = buildPostResultFollowUp(
+    resolvedLanguage,
+    message,
+    state,
+    rows.length > 0,
+  );
   const suggestions =
     rows.length > 8
       ? await buildChatSuggestions({
@@ -1675,7 +2437,10 @@ export async function chat(message: string, requestedLanguage?: unknown): Promis
     language: resolvedLanguage,
     status: "ok",
     answer,
+    follow_up_question: followUpQuestion,
     suggestions,
+    conversation_status: conversationStatus,
+    projects: projectCards,
     queryPlan: executedPlan,
     results: rows,
   };

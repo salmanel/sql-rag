@@ -1,9 +1,19 @@
-import OpenAI from "openai";
+import OpenAI, { AzureOpenAI } from "openai";
 
 const provider = (process.env.LLM_PROVIDER || "ollama").toLowerCase();
 const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
 const ollamaModel = process.env.OLLAMA_MODEL || "llama3.1:8b";
 const openRouterModel = process.env.OPENROUTER_MODEL || "openai/gpt-4.1-mini";
+const azureDeployment = process.env.AZURE_OPENAI_DEPLOYMENT_NAME;
+
+let azureClient: AzureOpenAI | null = null;
+if (provider === "azure") {
+  azureClient = new AzureOpenAI({
+    apiKey: process.env.AZURE_OPENAI_API_KEY,
+    endpoint: process.env.AZURE_OPENAI_ENDPOINT,
+    apiVersion: process.env.AZURE_OPENAI_API_VERSION,
+  });
+}
 
 async function queryOllama(systemPrompt: string, userPrompt: string, jsonMode: boolean): Promise<string> {
   const response = await fetch(`${ollamaBaseUrl}/api/chat`, {
@@ -81,6 +91,59 @@ async function queryOpenRouter(systemPrompt: string, userPrompt: string, jsonMod
   return content;
 }
 
+function extractTextContent(content: unknown): string {
+  if (typeof content === "string") {
+    return content.trim();
+  }
+
+  if (Array.isArray(content)) {
+    const text = content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object" && "text" in part && typeof (part as { text?: unknown }).text === "string") {
+          return (part as { text: string }).text;
+        }
+        return "";
+      })
+      .join("")
+      .trim();
+    return text;
+  }
+
+  return "";
+}
+
+async function queryAzure(systemPrompt: string, userPrompt: string, jsonMode: boolean): Promise<string> {
+  if (!azureClient) {
+    throw new Error("Azure OpenAI client not initialized. Check AZURE_OPENAI_* env vars.");
+  }
+  if (!azureDeployment) {
+    throw new Error("AZURE_OPENAI_DEPLOYMENT_NAME is required when LLM_PROVIDER=azure.");
+  }
+
+  const completion = await azureClient.chat.completions.create({
+    model: azureDeployment,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    max_completion_tokens: 2000,
+    response_format: jsonMode ? { type: "json_object" } : undefined,
+  });
+
+  const content = extractTextContent(completion.choices?.[0]?.message?.content);
+  if (!content) {
+    if (process.env.DEBUG_LLM === "true") {
+      console.warn("[query-ai] Azure empty response", {
+        finishReason: completion.choices?.[0]?.finish_reason,
+      });
+    }
+    return jsonMode ? "{}" : "I could not generate a response.";
+  }
+
+  return content;
+}
+
 export async function queryAI(systemPrompt: string, userPrompt: string, jsonMode: boolean = false): Promise<string> {
   if (provider === "ollama") {
     return queryOllama(systemPrompt, userPrompt, jsonMode);
@@ -90,5 +153,9 @@ export async function queryAI(systemPrompt: string, userPrompt: string, jsonMode
     return queryOpenRouter(systemPrompt, userPrompt, jsonMode);
   }
 
-  throw new Error(`Unsupported LLM_PROVIDER "${provider}". Use "ollama" or "openrouter".`);
+  if (provider === "azure") {
+    return queryAzure(systemPrompt, userPrompt, jsonMode);
+  }
+
+  throw new Error(`Unsupported LLM_PROVIDER "${provider}". Use "azure", "ollama" or "openrouter".`);
 }

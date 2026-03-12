@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+﻿import { FormEvent, useEffect, useMemo, useState } from "react";
 import { History, Home, Languages, MessageCircle, Moon, Plus, SendHorizonal, Sun } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
@@ -11,6 +11,7 @@ interface ChatMessage {
   role: Role;
   content: string;
   suggestions?: SuggestionChip[];
+  projects?: ProjectCard[];
 }
 
 interface ChatSession {
@@ -26,12 +27,23 @@ interface ChatApiResponse {
   answer: string;
   follow_up_question?: string;
   suggestions?: SuggestionChip[];
+  projects?: ProjectCard[];
+  conversation_status?: "normal" | "qualifying" | "lead_capture" | "appointment_ready";
+  required_fields?: Array<"name" | "phone" | "availability">;
 }
 
 interface SuggestionChip {
   label: string;
   payload: string;
   type?: string;
+}
+
+interface ProjectCard {
+  name: string;
+  city?: string;
+  description?: string;
+  price_range?: string;
+  images: string[];
 }
 
 const STORAGE_KEY = "homebot-chat-sessions-v1";
@@ -100,21 +112,9 @@ function sortSessionsByUpdatedAt(sessions: ChatSession[]): ChatSession[] {
 }
 
 function renderMessageContent(content: string) {
-  const lines = content.split("\n").map((line) => line.trim()).filter(Boolean);
-  const bulletLines = lines.filter((line) => /^[-•]\s+/.test(line) || /^\d+\.\s+/.test(line));
-
-  if (bulletLines.length >= 2) {
-    return (
-      <ul className="list-disc space-y-2 pl-6">
-        {bulletLines.map((line, index) => (
-          <li key={`${line}-${index}`}>{line.replace(/^[-•]\s+/, "").replace(/^\d+\.\s+/, "")}</li>
-        ))}
-      </ul>
-    );
-  }
-
   return <p className="whitespace-pre-line">{content}</p>;
 }
+
 
 function App() {
   const [language, setLanguage] = useState<Language>("en");
@@ -225,7 +225,7 @@ function App() {
       const response = await fetch(`${API_URL}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, language }),
+        body: JSON.stringify({ message, language, session_id: activeSessionId }),
       });
 
       if (!response.ok) throw new Error("chat_request_failed");
@@ -237,6 +237,7 @@ function App() {
           role: "assistant",
           content: data.answer,
           suggestions: data.suggestions?.slice(0, 8),
+          projects: data.projects,
         },
       ];
 
@@ -428,6 +429,41 @@ function App() {
                             >
                               {chip.label}
                             </button>
+                          ))}
+                        </div>
+                      )}
+                      {message.role === "assistant" && message.projects && message.projects.length > 0 && (
+                        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                          {message.projects.slice(0, 6).map((project, idx) => (
+                            <div
+                              key={`${message.id}-project-${idx}`}
+                              className={`overflow-hidden rounded-2xl border ${
+                                isDark ? "border-slate-700 bg-slate-800" : "border-slate-200 bg-slate-50"
+                              }`}
+                            >
+                              {project.images[0] ? (
+                                <img
+                                  src={project.images[0]}
+                                  alt={project.name}
+                                  className="h-36 w-full object-cover"
+                                  loading="lazy"
+                                />
+                              ) : null}
+                              <div className="space-y-1 p-3 text-sm">
+                                <div className="font-semibold">{project.name}</div>
+                                {project.city ? (
+                                  <div className={isDark ? "text-slate-300" : "text-slate-600"}>{project.city}</div>
+                                ) : null}
+                                {project.price_range ? (
+                                  <div className="text-emerald-600 dark:text-emerald-300">{project.price_range}</div>
+                                ) : null}
+                                {project.description ? (
+                                  <div className={isDark ? "text-slate-400" : "text-slate-600"}>
+                                    {project.description}
+                                  </div>
+                                ) : null}
+                              </div>
+                            </div>
                           ))}
                         </div>
                       )}

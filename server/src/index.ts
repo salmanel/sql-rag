@@ -7,6 +7,7 @@ import { initializeDb } from "./db";
 interface ChatRequestBody {
   message?: unknown;
   language?: unknown;
+  session_id?: unknown;
 }
 
 async function startServer() {
@@ -18,12 +19,12 @@ async function startServer() {
 
   const handleChatRequest = async (req: express.Request, res: express.Response) => {
     try {
-      const { message, language } = (req.body ?? {}) as ChatRequestBody;
+      const { message, language, session_id } = (req.body ?? {}) as ChatRequestBody;
       if (typeof message !== "string" || message.trim().length === 0) {
         return res.status(400).json({ error: "message is required" });
       }
 
-      const result = await chat(message, language);
+      const result = await chat(message, language, typeof session_id === "string" ? session_id : undefined);
       return res.json(result);
     } catch (error: any) {
       console.error("Chat error:", error);
