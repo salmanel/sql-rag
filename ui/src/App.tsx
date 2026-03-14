@@ -87,7 +87,18 @@ const content = {
   },
 } as const;
 
-function makeSession(): ChatSession {
+function buildIntroMessage(language: Language): ChatMessage {
+  return {
+    id: `intro-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    role: "assistant",
+    content:
+      language === "fr"
+        ? "Bonjour, je suis votre conseiller immobilier virtuel. Je suis la pour vous aider a trouver un bien, comparer les projets disponibles et organiser une visite si vous le souhaitez."
+        : "Hello, I am your virtual real estate advisor. I am here to help you find a property, compare available projects, and arrange a visit if you want.",
+  };
+}
+
+function makeSession(language: Language = "en"): ChatSession {
   const now = new Date().toISOString();
   const id = `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   return {
@@ -95,7 +106,7 @@ function makeSession(): ChatSession {
     title: "New chat",
     createdAt: now,
     updatedAt: now,
-    messages: [],
+    messages: [buildIntroMessage(language)],
   };
 }
 
@@ -145,7 +156,7 @@ function App() {
   useEffect(() => {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) {
-      const initial = makeSession();
+      const initial = makeSession(language);
       setSessions([initial]);
       setActiveSessionId(initial.id);
       return;
@@ -154,7 +165,7 @@ function App() {
     try {
       const parsed = JSON.parse(raw) as ChatSession[];
       if (!Array.isArray(parsed) || parsed.length === 0) {
-        const initial = makeSession();
+        const initial = makeSession(language);
         setSessions([initial]);
         setActiveSessionId(initial.id);
         return;
@@ -163,7 +174,7 @@ function App() {
       setSessions(sorted);
       setActiveSessionId(sorted[0].id);
     } catch {
-      const initial = makeSession();
+      const initial = makeSession(language);
       setSessions([initial]);
       setActiveSessionId(initial.id);
     }
@@ -192,7 +203,7 @@ function App() {
   };
 
   const createNewSession = () => {
-    const session = makeSession();
+    const session = makeSession(language);
     setSessions((prev) => [session, ...prev]);
     setActiveSessionId(session.id);
     setInput("");

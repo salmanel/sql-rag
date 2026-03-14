@@ -41,7 +41,9 @@ interface PresetExecution {
 }
 
 interface ProjectCard {
-  id?: number;
+  id?: string;
+  source_table?: string;
+  project_id?: string;
   name: string;
   city?: string;
   description?: string;
@@ -65,7 +67,9 @@ interface ConversationState {
   bedrooms?: number;
   features: string[];
   selectedProject?: string;
-  selectedProjectId?: number;
+  selectedProjectId?: string;
+  selectedProjectTable?: string;
+  selectedImmeubleId?: string;
   wantsVisit?: boolean;
   lead: LeadInfo;
 }
@@ -237,6 +241,22 @@ function detectVisitIntent(message: string): boolean {
   ]);
 }
 
+function detectAffirmativeMessage(message: string): boolean {
+  const normalized = normalizeForParsing(message).trim();
+  return [
+    "ok",
+    "okay",
+    "oui",
+    "yes",
+    "daccord",
+    "d accord",
+    "prenons un rendez vous",
+    "prendre rendez vous",
+    "on y va",
+    "allons y",
+  ].includes(normalized);
+}
+
 function detectBroadHousingIntent(message: string): boolean {
   return includesAny(message.toLowerCase(), [
     "project",
@@ -249,6 +269,49 @@ function detectBroadHousingIntent(message: string): boolean {
     "residence",
     "rÃ©sidence",
   ]);
+}
+
+function detectExplicitProjectsOnly(message: string): boolean {
+  return includesAny(normalizeForParsing(message), ["project", "projects", "projet", "projets", "programme"]);
+}
+
+function detectExplicitApartmentsOnly(message: string): boolean {
+  return includesAny(normalizeForParsing(message), [
+    "apartment",
+    "apartments",
+    "appartement",
+    "appartements",
+    "appart",
+    "immeuble",
+    "immeubles",
+    "unit",
+    "units",
+  ]);
+}
+
+function shouldSearchProjectsAndApartments(message: string): boolean {
+  const normalized = normalizeForParsing(message);
+  const explicitProjects = detectExplicitProjectsOnly(message);
+  const explicitApartments = detectExplicitApartmentsOnly(message);
+  const genericHousing = includesAny(normalized, [
+    "bien",
+    "biens",
+    "offre",
+    "offres",
+    "logement",
+    "logements",
+    "property",
+    "properties",
+    "real estate",
+    "immobilier",
+    "ce que vous avez",
+    "disponibilites",
+    "disponibilite",
+  ]);
+
+  if (explicitProjects && explicitApartments) return true;
+  if (!explicitProjects && !explicitApartments && genericHousing) return true;
+  return false;
 }
 
 function buildQualificationQuestion(language: ChatLanguage, field: "city" | "budget" | "bedrooms" | "features"): string {
@@ -543,7 +606,7 @@ function parseAppointmentDate(raw: string | undefined): Date {
   return new Date(parsed);
 }
 
-async function resolveProjectIdByName(projectName: string): Promise<number | null> {
+async function resolveProjectIdByName(projectName: string): Promise<string | null> {
   const exactSql = `SELECT TOP (1) [Id] FROM [dbo].[Projects] WHERE LOWER(CAST([Name] AS NVARCHAR(4000))) = LOWER(CAST(@p0 AS NVARCHAR(4000)));`;
   let result = await query(exactSql, [projectName.trim()]);
   if (!result.rows?.length) {
@@ -551,12 +614,30 @@ async function resolveProjectIdByName(projectName: string): Promise<number | nul
     result = await query(likeSql, [`%${projectName.trim()}%`]);
   }
   const value = result.rows?.[0]?.Id;
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string") {
-    const n = Number(value);
-    if (Number.isFinite(n)) return n;
-  }
+  if (typeof value === "string" && value.trim()) return value.trim();
   return null;
+}
+
+async function resolveImmeubleByName(
+  immeubleName: string,
+): Promise<{ immeubleId: string | null; projectId: string | null }> {
+  const exactSql = `SELECT TOP (1) [Id], [ProjectId] FROM [dbo].[Immeubles] WHERE LOWER(CAST([Name] AS NVARCHAR(4000))) = LOWER(CAST(@p0 AS NVARCHAR(4000)));`;
+  let result = await query(exactSql, [immeubleName.trim()]);
+  if (!result.rows?.length) {
+    const likeSql = `SELECT TOP (1) [Id], [ProjectId] FROM [dbo].[Immeubles] WHERE LOWER(CAST([Name] AS NVARCHAR(4000))) LIKE LOWER(CAST(@p0 AS NVARCHAR(4000))) ORDER BY LEN(CAST([Name] AS NVARCHAR(4000))) ASC;`;
+    result = await query(likeSql, [`%${immeubleName.trim()}%`]);
+  }
+
+  const row = result.rows?.[0];
+  const immeubleRaw = row?.Id;
+  const projectRaw = row?.ProjectId;
+  const immeubleId = typeof immeubleRaw === "string" && immeubleRaw.trim() ? immeubleRaw.trim() : null;
+  const projectId = typeof projectRaw === "string" && projectRaw.trim() ? projectRaw.trim() : null;
+
+  return {
+    immeubleId,
+    projectId,
+  };
 }
 
 async function persistAppointment(state: ConversationState): Promise<void> {
@@ -566,16 +647,32 @@ async function persistAppointment(state: ConversationState): Promise<void> {
     ? new Date(state.lead.appointmentDateIso)
     : parseAppointmentDate(state.lead.availability);
 
-  let projectId = state.selectedProjectId ?? null;
-  if (projectId === null && state.selectedProject) {
-    projectId = await resolveProjectIdByName(state.selectedProject);
+  let projectId: string | null = null;
+  let immeubleId: string | null = null;
+
+  if (state.selectedProjectTable === "immeubles") {
+    immeubleId = state.selectedImmeubleId ?? state.selectedProjectId ?? null;
+    projectId = state.selectedProjectId ?? null;
+    if ((immeubleId === null || projectId === null) && state.selectedProject) {
+      const resolved = await resolveImmeubleByName(state.selectedProject);
+      if (immeubleId === null) immeubleId = resolved.immeubleId;
+      if (projectId === null) projectId = resolved.projectId;
+    }
+  } else {
+    projectId = state.selectedProjectId ?? null;
+    if (projectId === null && state.selectedProject) {
+      projectId = await resolveProjectIdByName(state.selectedProject);
+    }
   }
 
+  const appointmentId = crypto.randomUUID();
+
   const insertSql = `INSERT INTO [dbo].[Appointments]
-([ProjectId], [AppointmentDate], [Name], [LastName], [Email], [PhoneNumber], [Status], [PropertyType])
-VALUES (@p0, @p1, @p2, @p3, @p4, @p5, @p6, @p7);`;
+([Id], [ProjectId], [AppointmentDate], [Name], [LastName], [Email], [PhoneNumber], [Status], [ImmeubleId], [PropertyType])
+VALUES (@p0, @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9);`;
 
   const insertParams: Array<string | number | boolean | Date | null> = [
+    appointmentId,
     projectId,
     appointmentDate,
     firstName,
@@ -583,19 +680,91 @@ VALUES (@p0, @p1, @p2, @p3, @p4, @p5, @p6, @p7);`;
     state.lead.email || null,
     state.lead.phone || null,
     "Pending",
+    immeubleId,
     "project",
   ];
 
-  // Preview mode by default: log the generated insert without writing to DB.
-  // Set APPOINTMENT_DRY_RUN=false to enable real inserts.
-  const dryRun = (process.env.APPOINTMENT_DRY_RUN || "true").toLowerCase() !== "false";
   console.log("[appointments] SQL preview:", insertSql);
   console.log("[appointments] SQL params:", JSON.stringify(insertParams));
-  if (dryRun) {
-    return;
+  await query(insertSql, insertParams);
+}
+
+async function runBroadInventorySearch(message: string): Promise<PresetExecution | null> {
+  if (!shouldSearchProjectsAndApartments(message)) {
+    return null;
   }
 
-  await query(insertSql, insertParams);
+  const city = extractLikelyLocationTerm(message);
+  const likeCity = city ? `%${city}%` : null;
+
+  const projectSql = city
+    ? `SELECT TOP (25)
+        [Id],
+        [Name],
+        [Address],
+        [Description],
+        [Images],
+        CAST(NULL AS NVARCHAR(100)) AS [ProjectId],
+        'projects' AS [SourceTable]
+      FROM [dbo].[Projects]
+      WHERE LOWER(CAST([Address] AS NVARCHAR(4000))) LIKE LOWER(CAST(@p0 AS NVARCHAR(4000)))
+      ORDER BY [Name] ASC;`
+    : `SELECT TOP (25)
+        [Id],
+        [Name],
+        [Address],
+        [Description],
+        [Images],
+        CAST(NULL AS NVARCHAR(100)) AS [ProjectId],
+        'projects' AS [SourceTable]
+      FROM [dbo].[Projects]
+      ORDER BY [Name] ASC;`;
+
+  const immeubleSql = city
+    ? `SELECT TOP (25)
+        [Id],
+        [Name],
+        [Location] AS [Address],
+        [Description],
+        [Images],
+        [ProjectId],
+        [MinPrice],
+        [MaxPrice],
+        'immeubles' AS [SourceTable]
+      FROM [dbo].[Immeubles]
+      WHERE LOWER(CAST([Location] AS NVARCHAR(4000))) LIKE LOWER(CAST(@p0 AS NVARCHAR(4000)))
+      ORDER BY [Name] ASC;`
+    : `SELECT TOP (25)
+        [Id],
+        [Name],
+        [Location] AS [Address],
+        [Description],
+        [Images],
+        [ProjectId],
+        [MinPrice],
+        [MaxPrice],
+        'immeubles' AS [SourceTable]
+      FROM [dbo].[Immeubles]
+      ORDER BY [Name] ASC;`;
+
+  const projectResult = await query(projectSql, likeCity ? [likeCity] : []);
+  logSql("broad-search:projects", projectSql, likeCity ? [likeCity] : [], projectResult.rows.length);
+  const immeubleResult = await query(immeubleSql, likeCity ? [likeCity] : []);
+  logSql("broad-search:immeubles", immeubleSql, likeCity ? [likeCity] : [], immeubleResult.rows.length);
+
+  const rows = [...projectResult.rows, ...immeubleResult.rows] as Record<string, unknown>[];
+  if (rows.length === 0) {
+    return null;
+  }
+
+  return {
+    plan: {
+      intent: { type: "lookup", table: "projects", columns: ["name", "address", "description", "images"] },
+      filters: city ? [{ field: "address", operator: "contains", value: city }] : [],
+      limit: 50,
+    },
+    rows,
+  };
 }
 
 function includesAny(text: string, terms: string[]): boolean {
@@ -1673,13 +1842,16 @@ function extractImageUrls(value: unknown): string[] {
   return candidates.filter((s) => /^https?:\/\//i.test(s)).slice(0, 5);
 }
 
-function mapRowsToProjectCards(rows: Record<string, unknown>[]): ProjectCard[] {
+function mapRowsToProjectCards(rows: Record<string, unknown>[], sourceTable?: string): ProjectCard[] {
   const cards: ProjectCard[] = [];
   const seen = new Set<string>();
 
   for (const row of rows) {
     const idRaw = firstExistingValue(row, ["id"]);
-    const id = idRaw ? Number(idRaw) : undefined;
+    const id = idRaw || undefined;
+    const projectIdRaw = firstExistingValue(row, ["projectid"]);
+    const projectId = projectIdRaw || undefined;
+    const rowSourceTable = firstExistingValue(row, ["sourcetable"]) || sourceTable;
     const name =
       firstExistingValue(row, ["name", "projectname", "project_name", "title", "immeublename"]) || "Projet";
     const city = firstExistingValue(row, ["address", "city", "ville", "location"]) || undefined;
@@ -1695,7 +1867,9 @@ function mapRowsToProjectCards(rows: Record<string, unknown>[]): ProjectCard[] {
     seen.add(key);
 
     cards.push({
-      id: Number.isFinite(id || NaN) ? id : undefined,
+      id,
+      source_table: rowSourceTable,
+      project_id: projectId,
       name,
       city,
       description,
@@ -1794,7 +1968,8 @@ async function generateQueryPlan(
   const normalizedMessage = normalizeMessageForPlanner(message);
   const schemaPrompt = renderAllowlistForPrompt(allowlist);
   const operators = Array.from(allowlist.operators).join(", ");
-  const plannerSystemPrompt = `You are a planner for a bilingual (fr/en) real-estate assistant.
+  const plannerSystemPrompt = `You are a planner for a bilingual (fr/en) real-estate sales assistant.
+The assistant behaves like a real estate agent helping clients discover projects, qualify their needs, and organize visits.
 Return ONLY valid JSON and no extra text.
 
 Planner output schema:
@@ -2039,10 +2214,12 @@ async function generateAnswer(
 ): Promise<string> {
   const presentationRows = enrichRowsWithPriceRange(sanitizeRowsForResponder(rows, message), message);
   const response = await queryAI(
-    `You are a client-facing real-estate assistant.
+    `You are a client-facing real-estate sales agent.
+You help clients as a professional real estate advisor.
 Reply in ${language === "fr" ? "French" : "English"}.
 Use only the provided query results and never invent missing facts.
 Keep a warm, concise, professional tone.
+Sound like a helpful agent, not a technical support bot.
 Do not mention SQL, query plans, allowlists, backend, internal validation, or system errors.
 Do not expose technical identifiers (id/uuid/coordinates) unless the user explicitly asked for them.
 When there are results:
@@ -2104,7 +2281,7 @@ export async function chat(message: string, requestedLanguage?: unknown, session
     state.features = Array.from(new Set([...state.features, ...extractedFeatures]));
   }
 
-  if (detectVisitIntent(message)) {
+  if (detectVisitIntent(message) || (state.selectedProject && detectAffirmativeMessage(message))) {
     state.wantsVisit = true;
     state.mode = "lead_capture";
   }
@@ -2245,14 +2422,25 @@ export async function chat(message: string, requestedLanguage?: unknown, session
   }
 
   const allowlist = await loadSchemaAllowlist();
-  const presetExecution = await runPresetQuery(message);
+  const broadInventoryExecution = await runBroadInventorySearch(message);
+  const presetExecution = broadInventoryExecution ?? (await runPresetQuery(message));
   if (presetExecution) {
     const rows = dedupeRows(presetExecution.rows);
-    const projectCards = mapRowsToProjectCards(enrichRowsWithPriceRange(rows, message));
+    const inferredSourceTable =
+      firstExistingValue(rows[0] || {}, ["sourcetable"])?.toLowerCase() || presetExecution.plan.intent.table;
+    const projectCards = mapRowsToProjectCards(enrichRowsWithPriceRange(rows, message), inferredSourceTable);
     if (!state.selectedProject && projectCards.length > 0) {
       state.selectedProject = projectCards[0].name;
-      if (typeof projectCards[0].id === "number") {
-        state.selectedProjectId = projectCards[0].id;
+      state.selectedProjectTable = projectCards[0].source_table;
+      if (typeof projectCards[0].id === "string") {
+        if (projectCards[0].source_table === "immeubles") {
+          state.selectedImmeubleId = projectCards[0].id;
+        } else {
+          state.selectedProjectId = projectCards[0].id;
+        }
+      }
+      if (typeof projectCards[0].project_id === "string") {
+        state.selectedProjectId = projectCards[0].project_id;
       }
     }
     const answer = await generateAnswer(resolvedLanguage, message, presetExecution.plan, rows);
@@ -2299,11 +2487,11 @@ export async function chat(message: string, requestedLanguage?: unknown, session
   const broadRequest = shouldAutoListProjects(message);
 
   if (planning.plannerStatus !== "ok" || broadRequest) {
-    const lang = planning.plannerLanguage;
+    const lang = resolvedLanguage;
     const defaultCityQuestion =
-      lang === "fr" ? "D'accord â€” vous cherchez des projets dans quelle ville ?" : "Sure â€” which city are you interested in?";
+      lang === "fr" ? "D'accord, vous cherchez des projets dans quelle ville ?" : "Sure, which city are you interested in?";
     const fallbackQuestion = lang === "fr" ? "Pouvez-vous reformuler votre demande ?" : "Could you rephrase your request?";
-    const followUp = broadRequest ? defaultCityQuestion : planning.askUser || fallbackQuestion;
+    const followUp = broadRequest ? defaultCityQuestion : fallbackQuestion;
     const suggestions = await buildChatSuggestions({
       allowlist,
       message,
@@ -2410,11 +2598,19 @@ export async function chat(message: string, requestedLanguage?: unknown, session
   }
 
   const answer = await generateAnswer(resolvedLanguage, message, executedPlan, rows);
-  const projectCards = mapRowsToProjectCards(enrichRowsWithPriceRange(rows, message));
+  const projectCards = mapRowsToProjectCards(enrichRowsWithPriceRange(rows, message), executedPlan.intent.table);
   if (!state.selectedProject && projectCards.length > 0) {
     state.selectedProject = projectCards[0].name;
-    if (typeof projectCards[0].id === "number") {
-      state.selectedProjectId = projectCards[0].id;
+    state.selectedProjectTable = projectCards[0].source_table;
+    if (typeof projectCards[0].id === "string") {
+      if (projectCards[0].source_table === "immeubles") {
+        state.selectedImmeubleId = projectCards[0].id;
+      } else {
+        state.selectedProjectId = projectCards[0].id;
+      }
+    }
+    if (typeof projectCards[0].project_id === "string") {
+      state.selectedProjectId = projectCards[0].project_id;
     }
   }
   const { followUpQuestion, conversationStatus } = buildPostResultFollowUp(
