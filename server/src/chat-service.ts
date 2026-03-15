@@ -96,6 +96,15 @@ const KNOWN_CITY_TOKENS = new Set([
   "agadir",
 ]);
 
+const LOCATION_VARIANTS: Record<string, string[]> = {
+  casablanca: ["casablanca", "casa", "casa blanca", "casa-blanca", "casa_blanca", "casablanka"],
+  rabat: ["rabat", "rabat agdal", "agdal"],
+  zenata: ["zenata", "znata"],
+  tanger: ["tanger", "tangier"],
+  marrakech: ["marrakech", "marrakesh"],
+  agadir: ["agadir"],
+};
+
 const DEBUG_SQL = process.env.DEBUG_SQL === "true";
 const conversationStore = new Map<string, ConversationState>();
 const EMPTY_PLAN: QueryPlan = {
@@ -695,7 +704,8 @@ async function runBroadInventorySearch(message: string): Promise<PresetExecution
   }
 
   const city = extractLikelyLocationTerm(message);
-  const likeCity = city ? `%${city}%` : null;
+  const projectFlexible = city ? buildFlexibleLocationWhereSql(["Address"], city) : null;
+  const immeubleFlexible = city ? buildFlexibleLocationWhereSql(["Location"], city) : null;
 
   const projectSql = city
     ? `SELECT TOP (25)
@@ -707,7 +717,7 @@ async function runBroadInventorySearch(message: string): Promise<PresetExecution
         CAST(NULL AS NVARCHAR(100)) AS [ProjectId],
         'projects' AS [SourceTable]
       FROM [dbo].[Projects]
-      WHERE LOWER(CAST([Address] AS NVARCHAR(4000))) LIKE LOWER(CAST(@p0 AS NVARCHAR(4000)))
+      WHERE ${projectFlexible!.whereSql}
       ORDER BY [Name] ASC;`
     : `SELECT TOP (25)
         [Id],
@@ -732,7 +742,7 @@ async function runBroadInventorySearch(message: string): Promise<PresetExecution
         [MaxPrice],
         'immeubles' AS [SourceTable]
       FROM [dbo].[Immeubles]
-      WHERE LOWER(CAST([Location] AS NVARCHAR(4000))) LIKE LOWER(CAST(@p0 AS NVARCHAR(4000)))
+      WHERE ${immeubleFlexible!.whereSql}
       ORDER BY [Name] ASC;`
     : `SELECT TOP (25)
         [Id],
@@ -747,10 +757,10 @@ async function runBroadInventorySearch(message: string): Promise<PresetExecution
       FROM [dbo].[Immeubles]
       ORDER BY [Name] ASC;`;
 
-  const projectResult = await query(projectSql, likeCity ? [likeCity] : []);
-  logSql("broad-search:projects", projectSql, likeCity ? [likeCity] : [], projectResult.rows.length);
-  const immeubleResult = await query(immeubleSql, likeCity ? [likeCity] : []);
-  logSql("broad-search:immeubles", immeubleSql, likeCity ? [likeCity] : [], immeubleResult.rows.length);
+  const projectResult = await query(projectSql, projectFlexible?.params || []);
+  logSql("broad-search:projects", projectSql, projectFlexible?.params || [], projectResult.rows.length);
+  const immeubleResult = await query(immeubleSql, immeubleFlexible?.params || []);
+  logSql("broad-search:immeubles", immeubleSql, immeubleFlexible?.params || [], immeubleResult.rows.length);
 
   const rows = [...projectResult.rows, ...immeubleResult.rows] as Record<string, unknown>[];
   if (rows.length === 0) {
@@ -973,6 +983,27 @@ function normalizeLocationTerm(term: string): string {
   return map[key] || key;
 }
 
+function normalizeLocationKey(value: string): string {
+  return normalizeForParsing(value).replace(/[\s._-]+/g, "");
+}
+
+function expandLocationSearchTerms(term: string): string[] {
+  const canonical = normalizeLocationTerm(term);
+  const variants = LOCATION_VARIANTS[canonical] || [canonical];
+  const expanded = new Set<string>();
+
+  for (const variant of variants) {
+    const cleaned = variant.trim();
+    if (!cleaned) continue;
+    expanded.add(cleaned);
+    expanded.add(normalizeLocationKey(cleaned));
+  }
+
+  expanded.add(canonical);
+  expanded.add(normalizeLocationKey(canonical));
+  return Array.from(expanded);
+}
+
 function normalizeForParsing(text: string): string {
   return text
     .toLowerCase()
@@ -1016,12 +1047,12 @@ async function runPresetQuery(message: string): Promise<PresetExecution | null> 
   if (preset === "projects_available_city") {
     const city = extractLikelyLocationTerm(message);
     if (!city) return null;
-    const likeCity = `%${city}%`;
+    const flexible = buildFlexibleLocationWhereSql(["Address"], city);
 
     const baseSql = `SELECT TOP (50)
       [Id], [Name], [Address], [Description], [Type], [StatusGlobal]
       FROM [dbo].[Projects]
-      WHERE LOWER(CAST([Address] AS NVARCHAR(4000))) LIKE LOWER(CAST(@p0 AS NVARCHAR(4000)))`;
+      WHERE ${flexible.whereSql}`;
 
     const withAvailability = `${baseSql}
       AND (
@@ -1031,13 +1062,13 @@ async function runPresetQuery(message: string): Promise<PresetExecution | null> 
       )
       ORDER BY [Name] ASC;`;
 
-    let result = await query(withAvailability, [likeCity]);
-    logSql("preset:projects_available_city:strict", withAvailability, [likeCity], result.rows.length);
+    let result = await query(withAvailability, flexible.params);
+    logSql("preset:projects_available_city:strict", withAvailability, flexible.params, result.rows.length);
 
     if ((result.rows || []).length === 0) {
       const relaxed = `${baseSql} ORDER BY [Name] ASC;`;
-      result = await query(relaxed, [likeCity]);
-      logSql("preset:projects_available_city:relaxed", relaxed, [likeCity], result.rows.length);
+      result = await query(relaxed, flexible.params);
+      logSql("preset:projects_available_city:relaxed", relaxed, flexible.params, result.rows.length);
     }
 
     return {
@@ -1490,6 +1521,33 @@ function quoteTable(schema: string, table: string): string {
   return `${quoteIdent(schema)}.${quoteIdent(table)}`;
 }
 
+function buildNormalizedLocationSql(column: string): string {
+  return `LOWER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(CAST(${quoteIdent(column)} AS NVARCHAR(4000)), ' ', ''), '-', ''), '_', ''), '.', ''), '''', ''))`;
+}
+
+function buildFlexibleLocationWhereSql(columns: string[], rawTerm: string): { whereSql: string; params: string[] } {
+  const terms = expandLocationSearchTerms(rawTerm);
+  const whereParts: string[] = [];
+  const params: string[] = [];
+
+  for (const column of columns) {
+    for (const term of terms) {
+      const ref = `@p${params.length}`;
+      params.push(`%${normalizeLocationKey(term)}%`);
+      whereParts.push(`${buildNormalizedLocationSql(column)} LIKE ${ref}`);
+    }
+
+    const soundexRef = `@p${params.length}`;
+    params.push(normalizeLocationTerm(rawTerm));
+    whereParts.push(`SOUNDEX(CAST(${quoteIdent(column)} AS NVARCHAR(4000))) = SOUNDEX(${soundexRef})`);
+  }
+
+  return {
+    whereSql: whereParts.length > 0 ? `(${whereParts.join(" OR ")})` : "1=0",
+    params,
+  };
+}
+
 async function runProjectCityRescueLookup(
   message: string,
   allowlist: SchemaAllowlist,
@@ -1527,15 +1585,9 @@ async function runProjectCityRescueLookup(
       "maxprice",
     ].filter((col, idx, arr) => table.columns.has(col) && arr.indexOf(col) === idx);
 
-    const whereParts: string[] = [];
-    const params: Array<string | number | boolean | Date | null> = [];
-    for (const col of locationCols) {
-      const ref = `@p${params.length}`;
-      params.push(`%${intent.city}%`);
-      whereParts.push(
-        `LOWER(CAST(${quoteIdent(col)} AS NVARCHAR(4000))) LIKE LOWER(CAST(${ref} AS NVARCHAR(4000)))`,
-      );
-    }
+    const flexible = buildFlexibleLocationWhereSql(locationCols, intent.city);
+    const whereParts: string[] = [flexible.whereSql];
+    const params: Array<string | number | boolean | Date | null> = [...flexible.params];
 
     const sql = `SELECT TOP (50) ${selectedColumns.length > 0 ? selectedColumns.map(quoteIdent).join(", ") : "*"}
 FROM ${quoteTable(table.schema, table.table)}
