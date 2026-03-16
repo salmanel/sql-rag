@@ -266,6 +266,20 @@ function detectAffirmativeMessage(message: string): boolean {
   ].includes(normalized);
 }
 
+function detectGreeting(message: string): boolean {
+  const normalized = normalizeForParsing(message).trim();
+  return [
+    "bonjour",
+    "salut",
+    "coucou",
+    "hello",
+    "hi",
+    "hey",
+    "bonsoir",
+    "salam",
+  ].includes(normalized);
+}
+
 function detectBroadHousingIntent(message: string): boolean {
   return includesAny(message.toLowerCase(), [
     "project",
@@ -2266,8 +2280,14 @@ async function generateAnswer(
 ): Promise<string> {
   const presentationRows = enrichRowsWithPriceRange(sanitizeRowsForResponder(rows, message), message);
   const response = await queryAI(
-    `You are a client-facing real-estate sales agent.
+    `You are a client-facing real-estate sales agent speaking to human clients.
 You help clients as a professional real estate advisor.
+Act like a real human commercial agent:
+- sound natural, warm, and confident
+- speak clearly and simply
+- show empathy when the client is unsure
+- guide the conversation helpfully instead of sounding robotic
+- when useful, suggest a next step like comparing options or arranging a visit
 Reply in ${language === "fr" ? "French" : "English"}.
 Use only the provided query results and never invent missing facts.
 Keep a warm, concise, professional tone.
@@ -2322,6 +2342,32 @@ export async function chat(message: string, requestedLanguage?: unknown, session
   const resolvedLanguage = await resolveChatLanguage(message, requestedLanguage, existingState);
   const state = getConversationState(sessionId, resolvedLanguage);
   state.language = resolvedLanguage;
+
+  if (detectGreeting(message)) {
+    return {
+      language: resolvedLanguage,
+      status: "ok",
+      answer:
+        resolvedLanguage === "fr"
+          ? "Bonjour. Je suis votre conseiller immobilier virtuel. Je peux vous aider a trouver un projet, un appartement, comparer les offres disponibles ou organiser une visite."
+          : "Hello. I am your virtual real estate advisor. I can help you find a project, an apartment, compare available offers, or arrange a visit.",
+      suggestions:
+        resolvedLanguage === "fr"
+          ? [
+              { label: "Projets a Rabat", payload: "Montre-moi les projets a Rabat", type: "city" },
+              { label: "Appartements a Casa", payload: "Je cherche un appartement a Casablanca", type: "city" },
+              { label: "Prendre rendez-vous", payload: "Je veux prendre rendez-vous pour une visite", type: "appointment" },
+            ]
+          : [
+              { label: "Projects in Rabat", payload: "Show me projects in Rabat", type: "city" },
+              { label: "Apartments in Casablanca", payload: "I am looking for an apartment in Casablanca", type: "city" },
+              { label: "Book a visit", payload: "I want to schedule a visit", type: "appointment" },
+            ],
+      queryPlan: EMPTY_PLAN,
+      results: [],
+    };
+  }
+
   const extractedCity = extractLikelyLocationTerm(message);
   if (extractedCity) state.city = extractedCity;
   const extractedBudget = extractBudget(message);
